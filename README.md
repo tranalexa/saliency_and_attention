@@ -34,7 +34,7 @@ supports our experimental findings.
 For the model randomization test, we randomize the weights of a
 model starting from the top layer, successively, all the way to
 the bottom layer. This procedure destroys the learned
-weights from the top layers to the bottom ones. We compare the resulting explanation from a network with random weights to the one obtained with the model’s original weights. Below we show the
+weights from the top layers to the bottom ones. We compare the resulting explanation from a network with random weights to the one obtained with the model's original weights. Below we show the
 evolution of saliency masks from different methods for a demo image from the ImageNet dataset and the Inception v3 model.
 
 <img src="https://raw.githubusercontent.com/adebayoj/sanity_checks_saliency/master/doc/figures/bird_cascading_demo.png" width="700">
@@ -70,7 +70,96 @@ A previous version of the paper said that Guided Backprop was completely invaria
 See /doc/data/ for the demo images and the ImageNet image ids used in this
 work.  
 
-### Instructions
+---
+
+## PyTorch extension (ViT, DINOv2, mechanistic checks)
+
+This fork adds a **PyTorch + timm + Captum** pipeline that extends Adebayo's
+cascading model randomization test to modern architectures.
+
+### Setup (virtual environment)
+
+From the repo root:
+
+```bash
+./scripts/setup_venv.sh
+source .venv/bin/activate
+```
+
+This installs [`requirements-pytorch.txt`](requirements-pytorch.txt) (notebooks, local GPU) and [`requirements-modal.txt`](requirements-modal.txt) (Modal CLI). To install manually:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements-pytorch.txt -r requirements-modal.txt
+```
+
+For **local** notebook runs (not Modal):
+
+```bash
+export IMAGENET_ROOT=/path/to/imagenet   # must contain val/
+jupyter notebook notebooks/
+```
+
+### Notebooks
+
+| Notebook | Purpose | Outputs |
+|----------|---------|---------|
+| `notebooks/notebook_resnet50_cascading.ipynb` | **Replication baseline** — ResNet-50, IG / GBP / GradCAM | `results/resnet50/` |
+| `notebooks/notebook_vit_cascading.ipynb` | ViT-B/16 + attention maps | `results/vit/` |
+| `notebooks/notebook_dinov2_cascading.ipynb` | DINOv2-B/14 @ 224 | `results/dinov2/` |
+| `notebooks/notebook_mechanistic.ipynb` | Logit correlation & activation scales (ResNet vs ViT) | `results/mechanistic/` |
+| `notebooks/notebook_analysis.ipynb` | Figures only (no model loading) | `results/figures/` |
+
+Legacy TensorFlow replication notebooks live in `notebooks/legacy_tf/`.
+
+### Shared utilities (`src/`)
+
+- `experiment_utils.py` — full pipelines (data loading, Captum, cascading, mechanistic); used by notebooks and Modal
+- `randomize_utils.py` — cascading weight reset (`reset_layer`, checkpoints, layer orders)
+- `metrics_utils.py` — Spearman, SSIM, logit Pearson correlation, map normalization
+- `attention_utils.py` — raw attention & rollout (Abnar & Zuidema 2020)
+
+### Running on Modal (cloud GPU)
+
+Run computation without local ImageNet storage. See **[docs/modal.md](docs/modal.md)** for full instructions.
+
+```bash
+source .venv/bin/activate
+modal setup
+# ImageNet on Modal (pick one):
+#   A) Download in cloud: modal run modal/download_imagenet.py --val-tar-url URL --devkit-tar-url URL
+#   B) Upload from laptop: modal volume put saliency-imagenet /path/to/imagenet/val /val
+modal run modal/app.py --experiment resnet50 --num-images 10 --skip-qual   # smoke test
+./scripts/download_modal_results.sh
+jupyter notebook notebooks/notebook_analysis.ipynb
+```
+
+Uses **NVIDIA A10G** by default. Full 500-image runs are expensive; always smoke-test with `--num-images 10` first.
+
+### Dataset
+
+- ImageNet **validation**, first **500** images (Binder-style convention)
+- 224×224 center crop, standard ImageNet normalization
+- Set `IMAGENET_ROOT` in each notebook CONFIG cell (or env var), or upload val to Modal volume `saliency-imagenet`
+
+### Expected qualitative behavior (ResNet replication)
+
+- **Guided Backprop**: high SSIM/Spearman when only upper layers are randomized; degrades when lower layers are randomized (Adebayo errata / Figure 2 style).
+- **Integrated Gradients / GradCAM**: similarity drops quickly as upper blocks are randomized.
+
+ViT and DINOv2 runs are **extensions** — attention methods (raw attention, rollout) are not part of the original Adebayo paper.
+
+### DINOv2 note
+
+`timm` model `vit_base_patch14_dinov2.lvd142m` may ship without a trained ImageNet classifier.
+Before the full 500-image loop, verify `model.num_classes == 1000` and sensible top-1 predictions;
+load an ImageNet linear head checkpoint if needed.
+
+---
+
+### Instructions (legacy TensorFlow)
 
 We have added scripts for training simple MLPs and CNNs on MNIST. To run any of the MNIST notebooks, use these scripts to quickly train either an MLP on MNIST (or Fashion MNIST) or a CNN on MNIST (or Fashion MNIST). The scripts are relatively straight forward. To run the inception v3 notebooks, you will also need to grab pre-trained weights and put them models folder as described in the instructions below.
 
@@ -109,15 +198,13 @@ tar -xvzf inception_v3_2016_08_28.tar.gz
 At the end of this, you should have the file *inception_v3.ckpt* in the folder *models/inceptionv3*. With this, you can run the inception notebooks.
 
 
-#### Notebooks
-In the notebook folder, you will find replication of the key experiments in the paper. Here is a quick summary of the notebooks provided:
+#### Notebooks (legacy TensorFlow)
 
-- *cnn_mnist_cascading_randomization.ipynb*: shows the cascading randomization on a CNN trained on MNIST.
+In `notebooks/legacy_tf/`, you will find replication of the key experiments in the paper:
 
-- *cnn_mnist_independent_randomization.ipynb*: shows the independent randomization on a CNN trained on MNIST.
-
-- *inceptionv3_cascading_randomization.ipynb*: shows the cascading randomization on an Inception v3 model trained on ImageNet for a single bird image. We also show how to compute similarity metrics. This notebook replicates Figure 2. from the paper.
-
-- *inceptionv3_independent_randomization.ipynb*: shows a quick overview of the independent randomization for inception_v3.
-
-- *inception_v3_guidedbackprop_demo.ipynb*: deeper dive into guided backprop with cascading randomization.
+- *cnn_mnist_cascading_randomization.ipynb*: cascading randomization on a CNN trained on MNIST.
+- *cnn_mnist_independent_randomization.ipynb*: independent randomization on a CNN trained on MNIST.
+- *inceptionv3_cascading_randomization.ipynb*: cascading randomization on Inception v3 (ImageNet).
+- *inceptionv3_independent_layer_randomization.ipynb*: independent randomization for Inception v3.
+- *inception_v3_guidedbackprop_demo.ipynb*: guided backprop with cascading randomization.
+- *mlp_mnist_cascading_randomization.ipynb*: cascading randomization on an MLP trained on MNIST.
