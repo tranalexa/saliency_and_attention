@@ -106,7 +106,7 @@ jupyter notebook notebooks/
 
 | Notebook | Purpose | Outputs |
 |----------|---------|---------|
-| `notebooks/notebook_resnet50_cascading.ipynb` | **Replication baseline** — ResNet-50, IG / GBP / GradCAM | `results/resnet50/` |
+| `notebooks/notebook_resnet50_cascading.ipynb` | **Replication baseline** — ResNet-50, all 8 Adebayo saliency methods | `results/resnet50/` |
 | `notebooks/notebook_vit_cascading.ipynb` | ViT-B/16 + attention maps | `results/vit/` |
 | `notebooks/notebook_dinov2_cascading.ipynb` | DINOv2-B/14 @ 224 | `results/dinov2/` |
 | `notebooks/notebook_mechanistic.ipynb` | Logit correlation & activation scales (ResNet vs ViT) | `results/mechanistic/` |
@@ -146,8 +146,12 @@ Uses **NVIDIA A10G** by default. Full 500-image runs are expensive; always smoke
 
 ### Expected qualitative behavior (ResNet replication)
 
-- **Guided Backprop**: high SSIM/Spearman when only upper layers are randomized; degrades when lower layers are randomized (Adebayo errata / Figure 2 style).
-- **Integrated Gradients / GradCAM**: similarity drops quickly as upper blocks are randomized.
+ResNet-50 runs all **8 methods** from the original paper (Gradient, SmoothGrad, Input-Grad, GBP, GradCAM, GBP-GC, IG, IG-SmoothGrad):
+
+- **Guided Backprop / GBP-GC / Input-Grad**: high SSIM/Spearman when only upper layers are randomized; Input-Grad often stays near 1.0 (strongest sanity-check failure).
+- **Integrated Gradients / Gradient / SmoothGrad / GradCAM**: similarity drops quickly as upper blocks are randomized.
+
+**MNIST** (used in the original paper's Figure 20) is a dataset of 70,000 handwritten digit images (0–9), 28×28 pixels — a classic deep-learning benchmark. The legacy TensorFlow MNIST notebooks live in `notebooks/legacy_tf/`.
 
 ViT and DINOv2 runs are **extensions** — attention methods (raw attention, rollout) are not part of the original Adebayo paper.
 

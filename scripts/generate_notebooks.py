@@ -215,7 +215,7 @@ ARCHS = {
         cell_code(
             """
 def plot_metric_curves(metric_suffix, ylabel, fname):
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=True)
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4), sharey=True)
     for ax, (arch, cfg) in zip(axes, ARCHS.items()):
         d = RESULTS_ROOT / arch
         if not d.exists():
@@ -226,11 +226,11 @@ def plot_metric_curves(metric_suffix, ylabel, fname):
             if not path.exists():
                 continue
             vals = np.load(path)
-            ax.plot(range(len(vals)), vals, marker="o", label=method)
+            ax.plot(range(len(vals)), vals, marker="o", label=method, markersize=3)
         ax.set_xlabel("Randomization depth")
         ax.set_ylabel(ylabel)
         ax.set_title(cfg["title"])
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=6, ncol=2)
     plt.tight_layout()
     plt.savefig(FIGURES_DIR / fname, dpi=150)
     plt.show()
@@ -308,6 +308,7 @@ def plot_cascading_grid(arch, method, title):
     plt.show()
 
 plot_cascading_grid("resnet50", "gbp", "ResNet-50 GBP (Adebayo replication check)")
+plot_cascading_grid("resnet50", "input_grad", "ResNet-50 Input-Grad")
 plot_cascading_grid("resnet50", "ig", "ResNet-50 IG")
 plot_cascading_grid("vit", "raw_attn", "ViT raw attention")
 plot_cascading_grid("dinov2", "rollout", "DINOv2 rollout")
