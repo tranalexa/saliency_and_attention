@@ -28,17 +28,37 @@ from randomize_utils import (
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-# Matches Adebayo et al. Inception/MNIST notebooks (pair-code/saliency).
-RESNET50_SALIENCY_METHODS = [
+# Cross-architecture method sets (Adebayo-style cascading sanity checks).
+SHARED_SALIENCY_METHODS = [
     "gradient",
     "smoothgrad",
     "input_grad",
-    "gbp",
-    "gradcam",
-    "gbp_gc",
     "ig",
     "ig_smoothgrad",
+    "gradcam",
 ]
+
+# GBP / GBP-GC use Guided Backprop (ReLU-specific); ResNet only.
+RESNET50_SALIENCY_METHODS = SHARED_SALIENCY_METHODS + ["gbp", "gbp_gc"]
+
+# ViT / DINOv2: shared Captum methods + attention (not in original Adebayo paper).
+VIT_SALIENCY_METHODS = SHARED_SALIENCY_METHODS + ["raw_attn", "rollout"]
+
+ARCH_SALIENCY_METHODS = {
+    "resnet50": RESNET50_SALIENCY_METHODS,
+    "vit": VIT_SALIENCY_METHODS,
+    "dinov2": VIT_SALIENCY_METHODS,
+}
+
+# IG-SmoothGrad is IG steps × noise samples; keep batches small on 24GB GPUs.
+METHOD_BATCH_CAPS = {
+    "ig_smoothgrad": 1,
+    "ig": 2,
+    "smoothgrad": 2,
+    "gbp_gc": 2,
+    "gbp": 4,
+    "gradcam": 4,
+}
 
 IMAGENET_UPLOAD_HINT = (
     "ImageNet not found. Options:\n"
@@ -97,13 +117,46 @@ def denormalize(tensor: torch.Tensor) -> torch.Tensor:
     return (tensor * std + mean).clamp(0, 1)
 
 
-def attribution_to_map(attr: torch.Tensor, out_size: int = 224) -> np.ndarray:
+def _clear_cuda() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _method_batch_size(method: str, batch_size: int) -> int:
+    cap = METHOD_BATCH_CAPS.get(method, batch_size)
+    return max(1, min(batch_size, cap))
+
+
+def attribution_to_map(
+    attr: torch.Tensor, out_size: int = 224, grid_size: int | None = None
+) -> np.ndarray:
     if attr.dim() == 4:
         attr = attr.sum(dim=1)
+    elif attr.dim() == 3 and grid_size is not None:
+        # ViT token attributions [B, N, C] or [B, 1, C] from a token layer.
+        tok = attr[0] if attr.shape[0] == 1 else attr
+        if tok.shape[0] == grid_size * grid_size + 1:
+            tok = tok[1:]
+        if tok.shape[0] == grid_size * grid_size:
+            arr = tok.abs().mean(dim=-1).reshape(grid_size, grid_size).detach().cpu().numpy()
+            t = torch.from_numpy(arr).float()[None, None]
+            up = F.interpolate(t, size=(out_size, out_size), mode="bilinear", align_corners=False)
+            return abs_grayscale_norm(up.squeeze().numpy())
     arr = attr.squeeze().detach().cpu().numpy()
     if arr.ndim == 1:
-        side = int(np.sqrt(arr.size))
-        arr = arr.reshape(side, side)
+        n_patches = grid_size * grid_size if grid_size is not None else None
+        if n_patches is not None and arr.size == n_patches + 1:
+            arr = arr[1:]
+        if n_patches is not None and arr.size == n_patches:
+            arr = arr.reshape(grid_size, grid_size)
+        else:
+            side = int(np.sqrt(arr.size))
+            if side * side != arr.size:
+                raise ValueError(
+                    "Cannot reshape attribution of size %d to a square grid"
+                    % arr.size
+                )
+            arr = arr.reshape(side, side)
     arr = np.abs(arr)
     t = torch.from_numpy(arr).float()[None, None]
     up = F.interpolate(t, size=(out_size, out_size), mode="bilinear", align_corners=False)
@@ -163,9 +216,11 @@ def compute_smoothgrad(
             target=tgt,
             nt_type="smoothgrad",
             stdevs=stdev,
-            n_samples=n_samples,
+            nt_samples=n_samples,
+            nt_samples_batch_size=1,
         )
         maps.append(attribution_to_map(attr))
+        _clear_cuda()
     return np.stack(maps)
 
 
@@ -190,7 +245,7 @@ def compute_ig_smoothgrad(
     target_indices: torch.Tensor,
     n_steps: int = 50,
     stdev: float = 0.15,
-    n_samples: int = 25,
+    n_samples: int = 10,
 ) -> np.ndarray:
     from captum.attr import IntegratedGradients, NoiseTunnel
 
@@ -207,9 +262,11 @@ def compute_ig_smoothgrad(
             n_steps=n_steps,
             nt_type="smoothgrad",
             stdevs=stdev,
-            n_samples=n_samples,
+            nt_samples=n_samples,
+            nt_samples_batch_size=1,
         )
         maps.append(attribution_to_map(attr))
+        _clear_cuda()
     return np.stack(maps)
 
 
@@ -244,6 +301,7 @@ def compute_gradcam(
     images: torch.Tensor,
     target_indices: torch.Tensor,
     layer: nn.Module,
+    grid_size: int | None = None,
 ) -> np.ndarray:
     from captum.attr import LayerGradCam
 
@@ -253,7 +311,7 @@ def compute_gradcam(
         inp = images[i : i + 1]
         tgt = int(target_indices[i].item())
         attr = cam.attribute(inp, target=tgt)
-        maps.append(attribution_to_map(attr))
+        maps.append(attribution_to_map(attr, grid_size=grid_size))
     return np.stack(maps)
 
 
@@ -272,6 +330,34 @@ def load_all_images(
     return torch.cat(all_images), torch.cat(all_targets)
 
 
+def _method_baseline_path(results_dir: Path, method: str) -> Path:
+    return results_dir / ("baseline_%s.npz" % method)
+
+
+def _method_baseline_exists(results_dir: Path, method: str) -> bool:
+    if _method_baseline_path(results_dir, method).exists():
+        return True
+    legacy = results_dir / "baseline_maps.npz"
+    if legacy.exists():
+        return ("baseline_" + method) in np.load(legacy).files
+    return False
+
+
+def load_baseline_maps(results_dir: Path, method: str) -> np.ndarray:
+    per_method = _method_baseline_path(results_dir, method)
+    if per_method.exists():
+        return np.load(per_method)["baseline_map"]
+    legacy = results_dir / "baseline_maps.npz"
+    if legacy.exists():
+        data = np.load(legacy)
+        key = "baseline_" + method
+        if key in data.files:
+            return data[key]
+    raise FileNotFoundError(
+        "Baseline maps for method %r not found under %s" % (method, results_dir)
+    )
+
+
 def compute_baseline_maps(
     model: nn.Module,
     all_images: torch.Tensor,
@@ -282,18 +368,22 @@ def compute_baseline_maps(
     batch_size: int,
     device: str,
 ) -> None:
-    baseline_path = results_dir / "baseline_maps.npz"
-    if baseline_path.exists():
+    missing = [m for m in methods if not _method_baseline_exists(results_dir, m)]
+    if not missing:
         return
-    baseline = {}
-    for method in tqdm(methods, desc="baseline"):
+    for method in tqdm(missing, desc="baseline"):
         batch_maps = []
-        for start in range(0, len(all_images), batch_size):
-            batch = all_images[start : start + batch_size].to(device)
-            tgt = all_targets[start : start + batch_size].to(device)
+        method_bs = _method_batch_size(method, batch_size)
+        for start in range(0, len(all_images), method_bs):
+            batch = all_images[start : start + method_bs].to(device)
+            tgt = all_targets[start : start + method_bs].to(device)
             batch_maps.append(compute_fn(method, batch, tgt))
-        baseline["baseline_" + method] = np.concatenate(batch_maps, axis=0)
-    np.savez_compressed(baseline_path, **baseline)
+            _clear_cuda()
+        baseline_map = np.concatenate(batch_maps, axis=0)
+        np.savez_compressed(
+            _method_baseline_path(results_dir, method),
+            baseline_map=baseline_map,
+        )
 
 
 def run_cascading_experiment(
@@ -310,14 +400,13 @@ def run_cascading_experiment(
     original_sd = save_checkpoint(model)
     num_depths = len(order)
     n_images = all_images.shape[0]
-    baseline_path = results_dir / "baseline_maps.npz"
 
     for method in methods:
         spearman_path = results_dir / ("%s_spearman.npy" % method)
         if spearman_path.exists():
             print("Skip", method)
             continue
-        baseline_maps = np.load(baseline_path)["baseline_" + method]
+        baseline_maps = load_baseline_maps(results_dir, method)
         spearman_all = np.full((num_depths, n_images), np.nan)
         ssim_all = np.full((num_depths, n_images), np.nan)
         for depth, _layer_name in enumerate(tqdm(order, desc=method)):
@@ -325,10 +414,12 @@ def run_cascading_experiment(
             for name in order[: depth + 1]:
                 reset_layer(model, name)
             rand_maps = []
-            for start in range(0, n_images, batch_size):
-                batch = all_images[start : start + batch_size].to(device)
-                tgt = all_targets[start : start + batch_size].to(device)
+            method_bs = _method_batch_size(method, batch_size)
+            for start in range(0, n_images, method_bs):
+                batch = all_images[start : start + method_bs].to(device)
+                tgt = all_targets[start : start + method_bs].to(device)
                 rand_maps.append(compute_fn(method, batch, tgt))
+                _clear_cuda()
             rand_maps = np.concatenate(rand_maps, axis=0)
             for i in range(n_images):
                 spearman_all[depth, i] = compute_spearman(baseline_maps[i], rand_maps[i])
@@ -371,6 +462,18 @@ def build_qual_bundle(
     np.savez_compressed(qual_path, **out)
 
 
+def reduce_activation_scales(t: torch.Tensor) -> torch.Tensor:
+    """Mean |activation| per channel/feature over batch and spatial/token dims."""
+    t = t.abs().float()
+    if t.dim() == 4:
+        return t.mean(dim=(0, 2, 3))
+    if t.dim() == 3:
+        return t.mean(dim=(0, 1))
+    if t.dim() == 2:
+        return t.mean(dim=0)
+    return t.mean().reshape(1)
+
+
 def run_mechanistic(
     model_name: str,
     arch_tag: str,
@@ -394,8 +497,9 @@ def run_mechanistic(
     logit_path = results_dir / ("logit_corr_%s.npy" % arch_tag)
     if not logit_path.exists():
         orig_logits = []
-        for images, _ in tqdm(loader, desc="orig logits " + arch_tag):
-            orig_logits.append(model(images.to(device)).cpu().numpy())
+        with torch.no_grad():
+            for images, _ in tqdm(loader, desc="orig logits " + arch_tag):
+                orig_logits.append(model(images.to(device)).detach().cpu().numpy())
         orig_logits = np.concatenate(orig_logits, axis=0)
         logit_corr = []
         for depth, _ in enumerate(tqdm(order, desc="logit " + arch_tag)):
@@ -403,8 +507,9 @@ def run_mechanistic(
             for name in order[: depth + 1]:
                 reset_layer(model, name)
             depth_logits = []
-            for images, _ in loader:
-                depth_logits.append(model(images.to(device)).cpu().numpy())
+            with torch.no_grad():
+                for images, _ in loader:
+                    depth_logits.append(model(images.to(device)).detach().cpu().numpy())
             logit_corr.append(compute_logit_correlation(orig_logits, np.concatenate(depth_logits)))
         np.save(logit_path, np.array(logit_corr))
 
@@ -422,14 +527,184 @@ def run_mechanistic(
             activations.append(out.detach())
 
         handle = model.get_submodule(hook_layer).register_forward_hook(hook_fn)
-        for images, _ in loader:
-            model(images.to(device))
+        with torch.no_grad():
+            for images, _ in loader:
+                model(images.to(device))
         handle.remove()
         scales = act_reduce(torch.cat(activations, dim=0)).cpu().numpy()
         np.save(act_path, scales)
 
     with open(results_dir / ("randomization_order_%s.json" % arch_tag), "w") as f:
         json.dump(order, f)
+
+
+def make_saliency_compute_fn(
+    model: nn.Module,
+    gradcam_layer: nn.Module,
+    *,
+    grid_size: int | None = None,
+    ig_steps: int = 50,
+    smoothgrad_stdev: float = 0.15,
+    smoothgrad_samples: int = 25,
+    ig_smoothgrad_samples: int = 10,
+    attention_grid_size: int | None = None,
+) -> Callable[[str, torch.Tensor, torch.Tensor], np.ndarray]:
+    """Dispatch saliency method name -> batched attribution maps."""
+
+    def compute_fn(method: str, batch: torch.Tensor, tgt: torch.Tensor) -> np.ndarray:
+        if method == "gradient":
+            return compute_gradient(model, batch, tgt)
+        if method == "smoothgrad":
+            return compute_smoothgrad(
+                model, batch, tgt, stdev=smoothgrad_stdev, n_samples=smoothgrad_samples
+            )
+        if method == "input_grad":
+            return compute_input_grad(model, batch, tgt)
+        if method == "gbp":
+            return compute_gbp(model, batch, tgt)
+        if method == "gradcam":
+            return compute_gradcam(model, batch, tgt, gradcam_layer, grid_size=grid_size)
+        if method == "gbp_gc":
+            return compute_gbp_gc(model, batch, tgt, gradcam_layer)
+        if method == "ig":
+            return compute_ig(model, batch, tgt, ig_steps)
+        if method == "ig_smoothgrad":
+            return compute_ig_smoothgrad(
+                model,
+                batch,
+                tgt,
+                n_steps=ig_steps,
+                stdev=smoothgrad_stdev,
+                n_samples=ig_smoothgrad_samples,
+            )
+        if attention_grid_size is not None:
+            if method == "raw_attn":
+                return np.stack(
+                    [
+                        get_raw_attention(model, batch[i : i + 1], attention_grid_size)
+                        for i in range(batch.shape[0])
+                    ]
+                )
+            if method == "rollout":
+                return np.stack(
+                    [
+                        get_rollout(model, batch[i : i + 1], attention_grid_size)
+                        for i in range(batch.shape[0])
+                    ]
+                )
+        raise ValueError("Unknown saliency method: %s" % method)
+
+    return compute_fn
+
+
+def _ensure_shared_metadata(
+    results_dir: Path,
+    image_indices: List[int],
+    all_targets: torch.Tensor,
+    order: List[str],
+) -> None:
+    indices_path = results_dir / "image_indices.npy"
+    if not indices_path.exists():
+        np.save(indices_path, np.array(image_indices))
+    targets_path = results_dir / "target_indices.npy"
+    if not targets_path.exists():
+        np.save(targets_path, all_targets.numpy())
+    order_path = results_dir / "randomization_order.json"
+    if not order_path.exists():
+        with open(order_path, "w") as f:
+            json.dump(order, f, indent=2)
+
+
+def run_arch_method_pipeline(
+    arch: str,
+    method: str,
+    imagenet_root: Path,
+    results_dir: Path,
+    num_images: int = 500,
+    image_size: int = 224,
+    batch_size: int = 8,
+    device: str = "cuda",
+    ig_steps: int = 50,
+    smoothgrad_stdev: float = 0.15,
+    smoothgrad_samples: int = 25,
+    ig_smoothgrad_samples: int = 10,
+    skip_qual: bool = True,
+) -> None:
+    """Run cascading sanity check for a single architecture + method (parallel Modal workers)."""
+    if arch not in ARCH_SALIENCY_METHODS:
+        raise ValueError("Unknown arch: %s (use resnet50|vit|dinov2)" % arch)
+    allowed = ARCH_SALIENCY_METHODS[arch]
+    if method not in allowed:
+        raise ValueError("Method %r not valid for arch %r (allowed: %s)" % (method, arch, allowed))
+
+    validate_imagenet_root(imagenet_root)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    transform = build_transform(image_size)
+    dataset, image_indices = load_imagenet_subset(imagenet_root, num_images, transform=transform)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    if arch == "resnet50":
+        model = timm.create_model("resnet50", pretrained=True).to(device).eval()
+        order = get_resnet_conv1_names(model)
+        gradcam_layer = model.layer4[-1].conv3
+        compute_fn = make_saliency_compute_fn(
+            model,
+            gradcam_layer,
+            ig_steps=ig_steps,
+            smoothgrad_stdev=smoothgrad_stdev,
+            smoothgrad_samples=smoothgrad_samples,
+            ig_smoothgrad_samples=ig_smoothgrad_samples,
+        )
+    elif arch == "vit":
+        model_name = "vit_base_patch16_224"
+        grid_size = 14
+        model = timm.create_model(model_name, pretrained=True, img_size=image_size).to(device).eval()
+        order = get_vit_block_names(model)
+        gradcam_layer = model.patch_embed.proj
+        compute_fn = make_saliency_compute_fn(
+            model,
+            gradcam_layer,
+            grid_size=grid_size,
+            ig_steps=ig_steps,
+            smoothgrad_stdev=smoothgrad_stdev,
+            smoothgrad_samples=smoothgrad_samples,
+            ig_smoothgrad_samples=ig_smoothgrad_samples,
+            attention_grid_size=grid_size,
+        )
+    elif arch == "dinov2":
+        model_name = "vit_base_patch14_dinov2.lvd142m"
+        grid_size = 16
+        model = timm.create_model(
+            model_name, pretrained=True, img_size=image_size, num_classes=1000
+        ).to(device).eval()
+        order = get_vit_block_names(model)
+        gradcam_layer = model.patch_embed.proj
+        compute_fn = make_saliency_compute_fn(
+            model,
+            gradcam_layer,
+            grid_size=grid_size,
+            ig_steps=ig_steps,
+            smoothgrad_stdev=smoothgrad_stdev,
+            smoothgrad_samples=smoothgrad_samples,
+            ig_smoothgrad_samples=ig_smoothgrad_samples,
+            attention_grid_size=grid_size,
+        )
+    else:
+        raise ValueError("Unknown arch: %s" % arch)
+
+    all_images, all_targets = load_all_images(loader, model, device)
+    _ensure_shared_metadata(results_dir, image_indices, all_targets, order)
+    compute_baseline_maps(
+        model, all_images, all_targets, [method], compute_fn, results_dir, batch_size, device
+    )
+    run_cascading_experiment(
+        model, order, all_images, all_targets, [method], compute_fn, results_dir, batch_size, device
+    )
+    if not skip_qual:
+        build_qual_bundle(
+            model, order, dataset, [method], compute_fn, results_dir, device
+        )
 
 
 def run_resnet50_pipeline(
@@ -442,6 +717,7 @@ def run_resnet50_pipeline(
     ig_steps: int = 50,
     smoothgrad_stdev: float = 0.15,
     smoothgrad_samples: int = 25,
+    ig_smoothgrad_samples: int = 10,
     skip_qual: bool = False,
 ) -> None:
     validate_imagenet_root(imagenet_root)
@@ -458,34 +734,14 @@ def run_resnet50_pipeline(
     with open(results_dir / "randomization_order.json", "w") as f:
         json.dump(order, f, indent=2)
     gradcam_layer = model.layer4[-1].conv3
-
-    def compute_fn(method, batch, tgt):
-        if method == "gradient":
-            return compute_gradient(model, batch, tgt)
-        if method == "smoothgrad":
-            return compute_smoothgrad(
-                model, batch, tgt, stdev=smoothgrad_stdev, n_samples=smoothgrad_samples
-            )
-        if method == "input_grad":
-            return compute_input_grad(model, batch, tgt)
-        if method == "gbp":
-            return compute_gbp(model, batch, tgt)
-        if method == "gradcam":
-            return compute_gradcam(model, batch, tgt, gradcam_layer)
-        if method == "gbp_gc":
-            return compute_gbp_gc(model, batch, tgt, gradcam_layer)
-        if method == "ig":
-            return compute_ig(model, batch, tgt, ig_steps)
-        if method == "ig_smoothgrad":
-            return compute_ig_smoothgrad(
-                model,
-                batch,
-                tgt,
-                n_steps=ig_steps,
-                stdev=smoothgrad_stdev,
-                n_samples=smoothgrad_samples,
-            )
-        raise ValueError("Unknown saliency method: %s" % method)
+    compute_fn = make_saliency_compute_fn(
+        model,
+        gradcam_layer,
+        ig_steps=ig_steps,
+        smoothgrad_stdev=smoothgrad_stdev,
+        smoothgrad_samples=smoothgrad_samples,
+        ig_smoothgrad_samples=ig_smoothgrad_samples,
+    )
 
     all_images, all_targets = load_all_images(loader, model, device)
     np.save(results_dir / "target_indices.npy", all_targets.numpy())
@@ -505,12 +761,15 @@ def run_vit_pipeline(
     batch_size: int = 8,
     device: str = "cuda",
     ig_steps: int = 50,
+    smoothgrad_stdev: float = 0.15,
+    smoothgrad_samples: int = 25,
+    ig_smoothgrad_samples: int = 10,
     skip_qual: bool = False,
     use_attention: bool = True,
 ) -> None:
     validate_imagenet_root(imagenet_root)
     results_dir.mkdir(parents=True, exist_ok=True)
-    methods = ["ig", "gradcam", "raw_attn", "rollout"] if use_attention else ["ig", "gradcam"]
+    methods = list(VIT_SALIENCY_METHODS) if use_attention else list(SHARED_SALIENCY_METHODS)
 
     transform = build_transform(image_size)
     dataset, image_indices = load_imagenet_subset(imagenet_root, num_images, transform=transform)
@@ -524,16 +783,17 @@ def run_vit_pipeline(
     order = get_vit_block_names(model)
     with open(results_dir / "randomization_order.json", "w") as f:
         json.dump(order, f, indent=2)
-    gradcam_layer = model.blocks[-1].norm1
-
-    def compute_fn(method, batch, tgt):
-        if method == "ig":
-            return compute_ig(model, batch, tgt, ig_steps)
-        if method == "gradcam":
-            return compute_gradcam(model, batch, tgt, gradcam_layer)
-        if method == "raw_attn":
-            return np.stack([get_raw_attention(model, batch[i : i + 1], grid_size) for i in range(batch.shape[0])])
-        return np.stack([get_rollout(model, batch[i : i + 1], grid_size) for i in range(batch.shape[0])])
+    gradcam_layer = model.patch_embed.proj
+    compute_fn = make_saliency_compute_fn(
+        model,
+        gradcam_layer,
+        grid_size=grid_size,
+        ig_steps=ig_steps,
+        smoothgrad_stdev=smoothgrad_stdev,
+        smoothgrad_samples=smoothgrad_samples,
+        ig_smoothgrad_samples=ig_smoothgrad_samples,
+        attention_grid_size=grid_size if use_attention else None,
+    )
 
     all_images, all_targets = load_all_images(loader, model, device)
     np.save(results_dir / "target_indices.npy", all_targets.numpy())
@@ -551,6 +811,9 @@ def run_dinov2_pipeline(
     batch_size: int = 8,
     device: str = "cuda",
     ig_steps: int = 50,
+    smoothgrad_stdev: float = 0.15,
+    smoothgrad_samples: int = 25,
+    ig_smoothgrad_samples: int = 10,
     skip_qual: bool = False,
 ) -> None:
     run_vit_pipeline(
@@ -563,6 +826,9 @@ def run_dinov2_pipeline(
         batch_size=batch_size,
         device=device,
         ig_steps=ig_steps,
+        smoothgrad_stdev=smoothgrad_stdev,
+        smoothgrad_samples=smoothgrad_samples,
+        ig_smoothgrad_samples=ig_smoothgrad_samples,
         skip_qual=skip_qual,
         use_attention=True,
     )
@@ -580,11 +846,11 @@ def run_mechanistic_pipeline(
     results_dir.mkdir(parents=True, exist_ok=True)
     run_mechanistic(
         "resnet50", "resnet", get_resnet_conv1_names,
-        lambda t: t.abs().mean(dim=(0, 2, 3)),
+        reduce_activation_scales,
         imagenet_root, results_dir, num_images, image_size, batch_size, device,
     )
     run_mechanistic(
         "vit_base_patch16_224", "vit", get_vit_block_names,
-        lambda t: t.abs().mean(dim=(0, 1)),
+        reduce_activation_scales,
         imagenet_root, results_dir, num_images, image_size, batch_size, device,
     )

@@ -84,20 +84,23 @@ From the repository root:
 # Smoke test (cheap)
 modal run modal/app.py --experiment resnet50 --num-images 10 --skip-qual
 
-# Full ResNet-50 replication baseline
-modal run modal/app.py --experiment resnet50 --num-images 500
+# Fast 500-image ResNet (8 GPUs — one per method, default)
+modal run modal/app.py --experiment resnet50 --num-images 500 --skip-qual --parallel-methods
 
-# ViT-B/16
-modal run modal/app.py --experiment vit --num-images 500
+# Full ResNet-50 on a single GPU (debug / lower concurrency cost)
+modal run modal/app.py --experiment resnet50 --num-images 500 --sequential
+
+# ViT-B/16 (8 methods, parallel by default)
+modal run modal/app.py --experiment vit --num-images 500 --skip-qual
 
 # DINOv2-B
-modal run modal/app.py --experiment dinov2 --num-images 500
+modal run modal/app.py --experiment dinov2 --num-images 500 --skip-qual
 
 # Mechanistic checks (ResNet + ViT)
 modal run modal/app.py --experiment mechanistic --num-images 500
 
-# All pipelines sequentially (long, expensive)
-modal run modal/app.py --experiment all --num-images 500
+# All pipelines in parallel (up to ~32 GPUs with parallel methods — expensive)
+modal run modal/app.py --experiment all --num-images 500 --skip-qual --parallel-methods
 ```
 
 ### CLI flags
@@ -108,6 +111,10 @@ modal run modal/app.py --experiment all --num-images 500
 | `--num-images` | `500` | Number of ImageNet val images (use `10` for testing) |
 | `--batch-size` | `8` | Batch size (mechanistic uses `16`) |
 | `--skip-qual` | false | Skip qualitative `qual_bundle.npz` generation |
+| `--parallel-methods` | true | Spawn one GPU job per saliency method (ResNet/ViT/DINO) |
+| `--sequential` | false | Run the full pipeline on a single GPU (disables parallel methods) |
+
+**Parallelism:** `--parallel-methods` (default) launches one A10G per saliency method. Wall-clock drops roughly 6–8× per architecture; total GPU-hours is similar, but you pay for concurrent GPUs. Use `--sequential` for cheap debugging. `--experiment all` with parallel methods can use up to ~32 GPUs at once (8 methods × 4 experiments).
 
 Results are written to the **`saliency-results`** volume under `/<arch>/` (e.g. `/resnet50/`). Inside the container these appear at `/results/<arch>/` because the volume is mounted at `/results`.
 
@@ -154,8 +161,10 @@ Figures are saved to `results/figures/`.
 
 ## Cost notes
 
-- Full runs (500 images × all randomization depths × multiple methods) are **GPU-heavy**.
+- Full runs (500 images × all randomization depths × 8 methods) are **GPU-heavy**.
 - Always start with `--num-images 10 --skip-qual`.
+- **`--parallel-methods`** (default) uses one GPU per method — faster wall-clock, same total GPU-hours, higher peak concurrency cost.
+- Use **`--sequential`** for single-GPU runs when debugging or limiting concurrent spend.
 - Pretrained weights are downloaded from timm on first run inside the container.
 
 ## Troubleshooting

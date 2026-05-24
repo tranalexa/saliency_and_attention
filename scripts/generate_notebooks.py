@@ -202,13 +202,33 @@ FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 ARCHS = {
     "resnet50": {
         "methods": [
-            "gradient", "smoothgrad", "input_grad", "gbp", "gradcam",
-            "gbp_gc", "ig", "ig_smoothgrad",
+            "gradient", "smoothgrad", "input_grad", "ig", "ig_smoothgrad", "gradcam",
+            "gbp", "gbp_gc",
         ],
         "title": "ResNet-50",
     },
-    "vit": {"methods": ["ig", "gradcam", "raw_attn", "rollout"], "title": "ViT-B/16"},
-    "dinov2": {"methods": ["ig", "gradcam", "raw_attn", "rollout"], "title": "DINOv2-B"},
+    "vit": {
+        "methods": [
+            "gradient", "smoothgrad", "input_grad", "ig", "ig_smoothgrad", "gradcam",
+            "raw_attn", "rollout",
+        ],
+        "title": "ViT-B/16",
+    },
+    "dinov2": {
+        "methods": [
+            "gradient", "smoothgrad", "input_grad", "ig", "ig_smoothgrad", "gradcam",
+            "raw_attn", "rollout",
+        ],
+        "title": "DINOv2-B",
+    },
+}
+SHARED_METHODS = [
+    "gradient", "smoothgrad", "input_grad", "ig", "ig_smoothgrad", "gradcam",
+]
+CROSS_ARCH_LABELS = {
+    "resnet50": "ResNet-50",
+    "vit": "ViT-B/16",
+    "dinov2": "DINOv2-B",
 }
 """
         ),
@@ -237,6 +257,36 @@ def plot_metric_curves(metric_suffix, ylabel, fname):
 
 plot_metric_curves("spearman_mean", "Spearman correlation", "spearman_curves.png")
 plot_metric_curves("ssim_mean", "SSIM", "ssim_curves.png")
+"""
+        ),
+        cell_code(
+            """
+def plot_cross_arch_curves(metric_suffix, ylabel, fname):
+    n_methods = len(SHARED_METHODS)
+    ncols = 3
+    nrows = int(np.ceil(n_methods / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), sharey=True)
+    axes = np.atleast_1d(axes).flatten()
+    for ax, method in zip(axes, SHARED_METHODS):
+        for arch, label in CROSS_ARCH_LABELS.items():
+            path = RESULTS_ROOT / arch / ("%s_%s.npy" % (method, metric_suffix))
+            if not path.exists():
+                continue
+            vals = np.load(path)
+            ax.plot(range(len(vals)), vals, marker="o", label=label, markersize=3)
+        ax.set_xlabel("Randomization depth")
+        ax.set_ylabel(ylabel)
+        ax.set_title(method)
+        ax.legend(fontsize=7)
+    for ax in axes[n_methods:]:
+        ax.axis("off")
+    fig.suptitle("Cross-architecture comparison (%s)" % ylabel, y=1.02)
+    plt.tight_layout()
+    plt.savefig(FIGURES_DIR / fname, dpi=150, bbox_inches="tight")
+    plt.show()
+
+plot_cross_arch_curves("spearman_mean", "Spearman correlation", "cross_arch_spearman.png")
+plot_cross_arch_curves("ssim_mean", "SSIM", "cross_arch_ssim.png")
 """
         ),
         cell_code(
@@ -310,6 +360,8 @@ def plot_cascading_grid(arch, method, title):
 plot_cascading_grid("resnet50", "gbp", "ResNet-50 GBP (Adebayo replication check)")
 plot_cascading_grid("resnet50", "input_grad", "ResNet-50 Input-Grad")
 plot_cascading_grid("resnet50", "ig", "ResNet-50 IG")
+plot_cascading_grid("vit", "ig", "ViT Integrated Gradients")
+plot_cascading_grid("vit", "input_grad", "ViT Input-Grad")
 plot_cascading_grid("vit", "raw_attn", "ViT raw attention")
 plot_cascading_grid("dinov2", "rollout", "DINOv2 rollout")
 print("Figures saved to", FIGURES_DIR)
