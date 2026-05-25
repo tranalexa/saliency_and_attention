@@ -376,7 +376,8 @@ for arch, cfg in ARCHS.items():
     data = np.load(qual_path, allow_pickle=True)
     img_idx = int(data["image_index"]) if "image_index" in data.files else 0
     order = list(data["order"])
-    depth_indices = select_depth_indices(len(order))
+    # None = all cascade steps (Adebayo shows every Mixed_7* / Conv2d_* column)
+    depth_indices = select_depth_indices(len(order), max_cols=None)
     plot_cascade_paper_grid(
         qual_path,
         cfg["methods"],
@@ -384,9 +385,22 @@ for arch, cfg in ARCHS.items():
         out_path=FIGURES_DIR / ("cascade_grid_%s.png" % arch),
         title=cfg["title"] + " cascading randomization (image %d)" % img_idx,
         arch=arch,
+        overlay=True,
+        max_depth_cols=None,
         show=True,
     )
-    print("%s paper grid -> cascade_grid_%s.png (image_index=%d)" % (arch, arch, img_idx))
+    plot_cascade_paper_grid(
+        qual_path,
+        cfg["methods"],
+        depth_indices=depth_indices,
+        out_path=FIGURES_DIR / ("cascade_grid_%s_masks.png" % arch),
+        title=cfg["title"] + " masks (image %d)" % img_idx,
+        arch=arch,
+        overlay=False,
+        max_depth_cols=None,
+        show=False,
+    )
+    print("%s -> cascade_grid_%s.png (overlay) and cascade_grid_%s_masks.png (image %d)" % (arch, arch, arch, img_idx))
 
 # Optional per-method vertical strips for slides
 for arch, method, title in [
@@ -403,6 +417,7 @@ for arch, method, title in [
         out_path=FIGURES_DIR / ("cascade_%s_%s.png" % (arch, method)),
         title=title,
         arch=arch,
+        overlay=True,
         show=False,
     )
 

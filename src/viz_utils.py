@@ -34,6 +34,34 @@ ARCH_TO_FAMILY = {
     "dinov2": ARCH_FAMILY_TRANSFORMER,
 }
 
+# ResNet-50 cascade labels aligned with Adebayo Inception figure naming
+# (top -> bottom: Mixed_7*, Mixed_6*, Mixed_5*, Conv2d_*). Maps block index within each stage.
+_RESNET_STAGE_MAX_BLOCK = {4: 2, 3: 5, 2: 3, 1: 2}
+_RESNET_STAGE_LABELS = {
+    4: ["Mixed_7c", "Mixed_7b", "Mixed_7a"],
+    3: ["Mixed_6e", "Mixed_6d", "Mixed_6c", "Mixed_6b", "Mixed_6a", "Mixed_6"],
+    2: ["Mixed_5d", "Mixed_5c", "Mixed_5b", "Mixed_5a"],
+    1: ["Conv2d_4a", "Conv2d_3b", "Conv2d_2b"],
+}
+
+
+def format_resnet_adebayo_label(layer_name: str) -> str:
+    """Map ResNet bottleneck conv1 names to Adebayo-style column labels (Mixed_7c, Conv2d_4a, Logits)."""
+    name = str(layer_name)
+    if name == "fc":
+        return "Logits"
+    m = re.match(r"layer(\d+)\.(\d+)\.conv1$", name)
+    if not m:
+        return short_layer_label(name)
+    stage, block = int(m.group(1)), int(m.group(2))
+    labels = _RESNET_STAGE_LABELS.get(stage)
+    max_block = _RESNET_STAGE_MAX_BLOCK.get(stage)
+    if labels is not None and max_block is not None:
+        idx = max_block - block
+        if 0 <= idx < len(labels):
+            return labels[idx]
+    return short_layer_label(name)
+
 
 def infer_arch_family(order: Sequence[str]) -> str:
     """Infer CNN (ResNet) vs transformer (ViT/DINOv2) from randomization order."""
@@ -66,11 +94,7 @@ def format_cascade_column_label(layer_name: str, arch_family: str) -> str:
         if name == "fc":
             return "Classifier"
     if arch_family == ARCH_FAMILY_CNN:
-        m = re.match(r"layer(\d+)\.(\d+)\.conv1$", name)
-        if m:
-            return "CNN S%s-B%s" % (m.group(1), m.group(2))
-        if name == "fc":
-            return "CNN classifier"
+        return format_resnet_adebayo_label(name)
     return short_layer_label(name)
 
 
@@ -95,14 +119,80 @@ def prepare_map_for_display(map_2d: np.ndarray) -> np.ndarray:
     return abs_grayscale_norm(np.asarray(map_2d))
 
 
-def select_depth_indices(n_depths: int, max_cols: int = 8) -> List[int]:
-    """Subsample cascade depth indices for readable figures (inclusive endpoints)."""
+def prepare_heatmap(
+    map_2d: np.ndarray,
+    percentile: float = 99.0,
+) -> np.ndarray:
+    """Normalize saliency for overlay; percentile clip avoids one-pixel max dominating."""
+    m = np.abs(np.asarray(map_2d, dtype=np.float64))
+    if m.size == 0:
+        return m
+    if percentile is not None and 0 < percentile < 100:
+        hi = float(np.percentile(m, percentile))
+        if hi > 0:
+            return np.clip(m / hi, 0.0, 1.0)
+    return abs_grayscale_norm(m)
+
+
+def overlay_saliency_on_image(
+    rgb: np.ndarray,
+    saliency: np.ndarray,
+    alpha: float = 0.45,
+    cmap: str = "jet",
+    percentile: float = 99.0,
+) -> np.ndarray:
+    """Blend a warm heatmap on the input image (Adebayo bird-demo style)."""
+    rgb = np.clip(np.asarray(rgb, dtype=np.float64), 0.0, 1.0)
+    if rgb.ndim != 3 or rgb.shape[-1] != 3:
+        raise ValueError("rgb must be HxWx3, got %s" % (rgb.shape,))
+    heat = prepare_heatmap(saliency, percentile=percentile)
+    colored = plt.get_cmap(cmap)(heat)[:, :, :3]
+    return np.clip((1.0 - alpha) * rgb + alpha * colored, 0.0, 1.0)
+
+
+def _show_map_panel(
+    ax: plt.Axes,
+    rgb: np.ndarray,
+    saliency: np.ndarray,
+    *,
+    overlay: bool,
+    show_input_only: bool = False,
+    overlay_alpha: float = 0.45,
+    heatmap_cmap: str = "jet",
+    display_percentile: float = 99.0,
+) -> None:
+    if show_input_only or (overlay and saliency is None):
+        ax.imshow(np.clip(rgb, 0, 1))
+    elif overlay:
+        ax.imshow(
+            overlay_saliency_on_image(
+                rgb,
+                saliency,
+                alpha=overlay_alpha,
+                cmap=heatmap_cmap,
+                percentile=display_percentile,
+            )
+        )
+    else:
+        ax.imshow(
+            prepare_map_for_display(saliency),
+            vmin=0.0,
+            vmax=1.0,
+            cmap="gray",
+        )
+
+
+def select_depth_indices(n_depths: int, max_cols: Optional[int] = None) -> List[int]:
+    """Subsample cascade depth indices. max_cols=None shows every step (Adebayo-style)."""
     if n_depths <= 0:
         return []
-    if n_depths <= max_cols:
+    if max_cols is None:
         return list(range(n_depths))
-    # max_cols includes baseline column separately; we want up to max_cols-1 depth columns
-    n_show = min(max_cols - 1, n_depths)
+    # max_cols is total grid columns including the Normal Model column
+    max_depth_cols = max_cols - 1
+    if n_depths <= max_depth_cols:
+        return list(range(n_depths))
+    n_show = max_depth_cols
     if n_show <= 1:
         return [0]
     if n_show == 2:
@@ -151,12 +241,22 @@ def plot_cascade_paper_grid(
     out_path: Optional[Union[str, Path]] = None,
     title: Optional[str] = None,
     arch: Optional[str] = None,
-    max_depth_cols: int = 8,
+    overlay: bool = True,
+    overlay_alpha: float = 0.45,
+    heatmap_cmap: str = "jet",
+    display_percentile: float = 99.0,
+    max_depth_cols: Optional[int] = None,
     dpi: int = 150,
     show: bool = False,
 ) -> Optional[plt.Figure]:
     """
     Adebayo-style grid: rows = saliency methods, cols = baseline + cascade depths.
+
+    max_depth_cols=None shows every randomization step (e.g. all 17 for ResNet-50).
+    Set max_depth_cols=8 to subsample for a compact figure.
+
+    overlay=True blends a jet-style heatmap on the stored input image (paper bird figure).
+    overlay=False shows grayscale masks on black only.
     """
     qual_path = Path(qual_path)
     if not qual_path.exists():
@@ -167,6 +267,8 @@ def plot_cascade_paper_grid(
     if not methods:
         return None
 
+    rgb = np.clip(np.asarray(data["image"], dtype=np.float64), 0.0, 1.0)
+
     cascade0 = data["cascade_" + methods[0]]
     n_depths = len(cascade0)
     if depth_indices is None:
@@ -174,7 +276,7 @@ def plot_cascade_paper_grid(
     depth_indices = list(depth_indices)
     arch_family = resolve_arch_family(arch, order)
 
-    col_labels = ["Normal\nmodel"]
+    col_labels = ["Normal\nModel"]
     for d in depth_indices:
         layer = order[d] if d < len(order) else ""
         col_labels.append(format_cascade_column_label(layer, arch_family))
@@ -182,7 +284,8 @@ def plot_cascade_paper_grid(
     nrows = len(methods)
     ncols = 1 + len(depth_indices)
     label_col_width = 0.48
-    fig_w = 1.15 * ncols + label_col_width
+    col_inches = 0.72 if ncols > 14 else (0.85 if ncols > 10 else 1.15)
+    fig_w = col_inches * ncols + label_col_width
     fig_h = max(1.05 * nrows, 4.0)
     fig = plt.figure(figsize=(fig_w, fig_h))
     grid_top = 0.84 if title else 0.90
@@ -211,28 +314,41 @@ def plot_cascade_paper_grid(
             linespacing=1.25,
             transform=ax_label.transAxes,
         )
-        baseline = prepare_map_for_display(data["baseline_" + method])
         cascade = data["cascade_" + method]
         for j in range(ncols):
             ax = fig.add_subplot(gs[i, j + 1])
             if j == 0:
-                ax.imshow(baseline, vmin=0.0, vmax=1.0, cmap="gray")
+                # Normal Model = saliency from pretrained weights (not a plain photo).
+                _show_map_panel(
+                    ax,
+                    rgb,
+                    data["baseline_" + method],
+                    overlay=overlay,
+                    overlay_alpha=overlay_alpha,
+                    heatmap_cmap=heatmap_cmap,
+                    display_percentile=display_percentile,
+                )
             else:
                 d = depth_indices[j - 1]
-                ax.imshow(
-                    prepare_map_for_display(cascade[d]),
-                    vmin=0.0,
-                    vmax=1.0,
-                    cmap="gray",
+                _show_map_panel(
+                    ax,
+                    rgb,
+                    cascade[d],
+                    overlay=overlay,
+                    overlay_alpha=overlay_alpha,
+                    heatmap_cmap=heatmap_cmap,
+                    display_percentile=display_percentile,
                 )
             ax.set_xticks([])
             ax.set_yticks([])
             if i == 0:
+                title_fs = 7 if ncols > 14 else 8
+                title_rot = 55 if ncols > 10 else 35
                 ax.set_title(
                     col_labels[j],
-                    fontsize=8,
+                    fontsize=title_fs,
                     pad=12,
-                    rotation=35,
+                    rotation=title_rot,
                     ha="right",
                 )
 
@@ -253,6 +369,10 @@ def plot_cascading_grid(
     out_path: Optional[Union[str, Path]] = None,
     title: Optional[str] = None,
     arch: Optional[str] = None,
+    overlay: bool = True,
+    overlay_alpha: float = 0.45,
+    heatmap_cmap: str = "jet",
+    display_percentile: float = 99.0,
     dpi: int = 150,
     show: bool = False,
 ) -> Optional[plt.Figure]:
@@ -267,20 +387,37 @@ def plot_cascading_grid(
     cascade = data[key]
     order = list(data["order"])
     arch_family = resolve_arch_family(arch, order)
+    rgb = np.clip(np.asarray(data["image"], dtype=np.float64), 0.0, 1.0)
     nrows = len(cascade) + 2
     fig = plt.figure(figsize=(4, 0.4 * nrows))
     gs = gridspec.GridSpec(nrows, 1)
     ax = fig.add_subplot(gs[0])
-    ax.imshow(data["image"])
+    ax.imshow(rgb)
     ax.set_title("Input")
     ax.axis("off")
     ax = fig.add_subplot(gs[1])
-    ax.imshow(prepare_map_for_display(data["baseline_" + method]), vmin=0, vmax=1, cmap="gray")
+    _show_map_panel(
+        ax,
+        rgb,
+        data["baseline_" + method],
+        overlay=overlay,
+        overlay_alpha=overlay_alpha,
+        heatmap_cmap=heatmap_cmap,
+        display_percentile=display_percentile,
+    )
     ax.set_title("Baseline (no randomization)")
     ax.axis("off")
     for i, m in enumerate(cascade):
         ax = fig.add_subplot(gs[i + 2])
-        ax.imshow(prepare_map_for_display(m), vmin=0, vmax=1, cmap="gray")
+        _show_map_panel(
+            ax,
+            rgb,
+            m,
+            overlay=overlay,
+            overlay_alpha=overlay_alpha,
+            heatmap_cmap=heatmap_cmap,
+            display_percentile=display_percentile,
+        )
         layer = order[i] if i < len(order) else ""
         ax.set_title(
             "Depth %d: %s" % (i, format_cascade_column_label(layer, arch_family)),

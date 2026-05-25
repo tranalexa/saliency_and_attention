@@ -152,7 +152,7 @@ modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim
 jupyter notebook notebooks/notebook_analysis.ipynb
 ```
 
-Outputs: `results/figures/cascade_grid_<arch>.png` (rows = methods, cols = baseline + cascade depths). Legacy Adebayo layout is documented in `notebooks/legacy_tf/inceptionv3_cascading_randomization.ipynb`.
+Outputs: `results/figures/cascade_grid_<arch>.png` (jet heatmap overlaid on the input image, Adebayo bird-demo style) and `cascade_grid_<arch>_masks.png` (grayscale masks only). Legacy TF layout is in `notebooks/legacy_tf/inceptionv3_cascading_randomization.ipynb`.
 
 ### Dataset
 
