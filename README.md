@@ -106,10 +106,10 @@ jupyter notebook notebooks/
 
 | Notebook | Purpose | Outputs |
 |----------|---------|---------|
-| `notebooks/notebook_resnet50_cascading.ipynb` | **Replication baseline** — ResNet-50, all 8 Adebayo saliency methods | `results/resnet50/` |
-| `notebooks/notebook_vit_cascading.ipynb` | ViT-B/16 — 8 methods (6 shared Captum + attention) | `results/vit/` |
-| `notebooks/notebook_dinov2_cascading.ipynb` | DINOv2-B/14 @ 224 — same 8-method set as ViT | `results/dinov2/` |
-| `notebooks/notebook_mechanistic.ipynb` | Logit correlation & activation scales (ResNet vs ViT) | `results/mechanistic/` |
+| `notebooks/notebook_resnet50_cascading.ipynb` | **Replication baseline** — ResNet-50, 7 saliency methods | `results/resnet50/` |
+| `notebooks/notebook_vit_cascading.ipynb` | ViT-B/16 — 7 methods (5 shared Captum + attention) | `results/vit/` |
+| `notebooks/notebook_dinov2_cascading.ipynb` | DINOv2-B/14 @ 224 — same 7-method set as ViT | `results/dinov2/` |
+| `notebooks/notebook_mechanistic.ipynb` | Logit correlation & activation scales (ResNet vs ViT vs DINOv2) | `results/mechanistic/` |
 | `notebooks/notebook_analysis.ipynb` | Figures only (no model loading) | `results/figures/` |
 
 Legacy TensorFlow replication notebooks live in `notebooks/legacy_tf/`.
@@ -132,7 +132,7 @@ modal setup
 #   A) Download in cloud: modal run modal/download_imagenet.py --val-tar-url URL --devkit-tar-url URL
 #   B) Upload from laptop: modal volume put saliency-imagenet /path/to/imagenet/val /val
 modal run modal/app.py --experiment resnet50 --num-images 10 --skip-qual   # smoke test
-# Fast 500-image run (8 GPUs in parallel, one per method):
+# Fast 500-image run (7 GPUs per arch in parallel, one per method):
 modal run modal/app.py --experiment resnet50 --num-images 500 --skip-qual --parallel-methods
 ./scripts/download_modal_results.sh
 jupyter notebook notebooks/notebook_analysis.ipynb
@@ -148,7 +148,7 @@ Uses **NVIDIA A10G** by default. Full 500-image runs are expensive; always smoke
 
 ### Expected qualitative behavior (ResNet replication)
 
-ResNet-50 runs all **8 methods** from the original paper (Gradient, SmoothGrad, Input-Grad, GBP, GradCAM, GBP-GC, IG, IG-SmoothGrad):
+ResNet-50 runs **7 methods** (Gradient, SmoothGrad, Input-Grad, GBP, GradCAM, GBP-GC, IG):
 
 - **Guided Backprop / GBP-GC / Input-Grad**: high SSIM/Spearman when only upper layers are randomized; Input-Grad often stays near 1.0 (strongest sanity-check failure).
 - **Integrated Gradients / Gradient / SmoothGrad / GradCAM**: similarity drops quickly as upper blocks are randomized.
@@ -159,11 +159,11 @@ ResNet-50 runs all **8 methods** from the original paper (Gradient, SmoothGrad, 
 
 | Method | ResNet-50 | ViT / DINOv2 | Notes |
 |--------|-----------|--------------|-------|
-| Gradient, SmoothGrad, Input-Grad, IG, IG-SmoothGrad, GradCAM | yes | yes | **6 shared methods** — directly comparable across architectures |
+| Gradient, SmoothGrad, Input-Grad, IG, GradCAM | yes | yes | **5 shared methods** — directly comparable across architectures |
 | GBP, GBP-GC | yes | no | ReLU-specific Guided Backprop (ResNet only) |
 | Raw attention, Rollout | no | yes | Transformer attention maps |
 
-ViT and DINOv2 runs are **extensions** of the Adebayo cascading test. The analysis notebook includes cross-architecture overlay plots for the 6 shared methods.
+ViT and DINOv2 runs are **extensions** of the Adebayo cascading test. The analysis notebook includes cross-architecture overlay plots for the 5 shared methods (ResNet vs ViT vs DINOv2), ViT vs DINOv2 attention methods, and mechanistic checks across all three architectures.
 
 ### DINOv2 note
 

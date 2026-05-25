@@ -34,7 +34,6 @@ SHARED_SALIENCY_METHODS = [
     "smoothgrad",
     "input_grad",
     "ig",
-    "ig_smoothgrad",
     "gradcam",
 ]
 
@@ -50,9 +49,7 @@ ARCH_SALIENCY_METHODS = {
     "dinov2": VIT_SALIENCY_METHODS,
 }
 
-# IG-SmoothGrad is IG steps × noise samples; keep batches small on 24GB GPUs.
 METHOD_BATCH_CAPS = {
-    "ig_smoothgrad": 1,
     "ig": 2,
     "smoothgrad": 2,
     "gbp_gc": 2,
@@ -236,37 +233,6 @@ def compute_input_grad(
         tgt = int(target_indices[i].item())
         attr = ixg.attribute(inp, target=tgt)
         maps.append(attribution_to_map(attr))
-    return np.stack(maps)
-
-
-def compute_ig_smoothgrad(
-    model: nn.Module,
-    images: torch.Tensor,
-    target_indices: torch.Tensor,
-    n_steps: int = 50,
-    stdev: float = 0.15,
-    n_samples: int = 10,
-) -> np.ndarray:
-    from captum.attr import IntegratedGradients, NoiseTunnel
-
-    ig = IntegratedGradients(model)
-    nt = NoiseTunnel(ig)
-    maps = []
-    for i in range(images.shape[0]):
-        inp = images[i : i + 1]
-        tgt = int(target_indices[i].item())
-        attr = nt.attribute(
-            inp,
-            baselines=torch.zeros_like(inp),
-            target=tgt,
-            n_steps=n_steps,
-            nt_type="smoothgrad",
-            stdevs=stdev,
-            nt_samples=n_samples,
-            nt_samples_batch_size=1,
-        )
-        maps.append(attribution_to_map(attr))
-        _clear_cuda()
     return np.stack(maps)
 
 
@@ -485,12 +451,14 @@ def run_mechanistic(
     image_size: int = 224,
     batch_size: int = 16,
     device: str = "cuda",
+    model_kwargs: dict | None = None,
 ) -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
     transform = build_transform(image_size)
     dataset, _ = load_imagenet_subset(imagenet_root, num_images, transform=transform)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-    model = timm.create_model(model_name, pretrained=True).to(device).eval()
+    create_kwargs = {"pretrained": True, **(model_kwargs or {})}
+    model = timm.create_model(model_name, **create_kwargs).to(device).eval()
     order = order_fn(model)
     original_sd = save_checkpoint(model)
 
@@ -546,7 +514,6 @@ def make_saliency_compute_fn(
     ig_steps: int = 50,
     smoothgrad_stdev: float = 0.15,
     smoothgrad_samples: int = 25,
-    ig_smoothgrad_samples: int = 10,
     attention_grid_size: int | None = None,
 ) -> Callable[[str, torch.Tensor, torch.Tensor], np.ndarray]:
     """Dispatch saliency method name -> batched attribution maps."""
@@ -568,15 +535,6 @@ def make_saliency_compute_fn(
             return compute_gbp_gc(model, batch, tgt, gradcam_layer)
         if method == "ig":
             return compute_ig(model, batch, tgt, ig_steps)
-        if method == "ig_smoothgrad":
-            return compute_ig_smoothgrad(
-                model,
-                batch,
-                tgt,
-                n_steps=ig_steps,
-                stdev=smoothgrad_stdev,
-                n_samples=ig_smoothgrad_samples,
-            )
         if attention_grid_size is not None:
             if method == "raw_attn":
                 return np.stack(
@@ -627,7 +585,6 @@ def run_arch_method_pipeline(
     ig_steps: int = 50,
     smoothgrad_stdev: float = 0.15,
     smoothgrad_samples: int = 25,
-    ig_smoothgrad_samples: int = 10,
     skip_qual: bool = True,
 ) -> None:
     """Run cascading sanity check for a single architecture + method (parallel Modal workers)."""
@@ -654,7 +611,6 @@ def run_arch_method_pipeline(
             ig_steps=ig_steps,
             smoothgrad_stdev=smoothgrad_stdev,
             smoothgrad_samples=smoothgrad_samples,
-            ig_smoothgrad_samples=ig_smoothgrad_samples,
         )
     elif arch == "vit":
         model_name = "vit_base_patch16_224"
@@ -669,7 +625,6 @@ def run_arch_method_pipeline(
             ig_steps=ig_steps,
             smoothgrad_stdev=smoothgrad_stdev,
             smoothgrad_samples=smoothgrad_samples,
-            ig_smoothgrad_samples=ig_smoothgrad_samples,
             attention_grid_size=grid_size,
         )
     elif arch == "dinov2":
@@ -687,7 +642,6 @@ def run_arch_method_pipeline(
             ig_steps=ig_steps,
             smoothgrad_stdev=smoothgrad_stdev,
             smoothgrad_samples=smoothgrad_samples,
-            ig_smoothgrad_samples=ig_smoothgrad_samples,
             attention_grid_size=grid_size,
         )
     else:
@@ -717,7 +671,6 @@ def run_resnet50_pipeline(
     ig_steps: int = 50,
     smoothgrad_stdev: float = 0.15,
     smoothgrad_samples: int = 25,
-    ig_smoothgrad_samples: int = 10,
     skip_qual: bool = False,
 ) -> None:
     validate_imagenet_root(imagenet_root)
@@ -740,7 +693,6 @@ def run_resnet50_pipeline(
         ig_steps=ig_steps,
         smoothgrad_stdev=smoothgrad_stdev,
         smoothgrad_samples=smoothgrad_samples,
-        ig_smoothgrad_samples=ig_smoothgrad_samples,
     )
 
     all_images, all_targets = load_all_images(loader, model, device)
@@ -763,7 +715,6 @@ def run_vit_pipeline(
     ig_steps: int = 50,
     smoothgrad_stdev: float = 0.15,
     smoothgrad_samples: int = 25,
-    ig_smoothgrad_samples: int = 10,
     skip_qual: bool = False,
     use_attention: bool = True,
 ) -> None:
@@ -791,7 +742,6 @@ def run_vit_pipeline(
         ig_steps=ig_steps,
         smoothgrad_stdev=smoothgrad_stdev,
         smoothgrad_samples=smoothgrad_samples,
-        ig_smoothgrad_samples=ig_smoothgrad_samples,
         attention_grid_size=grid_size if use_attention else None,
     )
 
@@ -813,7 +763,6 @@ def run_dinov2_pipeline(
     ig_steps: int = 50,
     smoothgrad_stdev: float = 0.15,
     smoothgrad_samples: int = 25,
-    ig_smoothgrad_samples: int = 10,
     skip_qual: bool = False,
 ) -> None:
     run_vit_pipeline(
@@ -828,7 +777,6 @@ def run_dinov2_pipeline(
         ig_steps=ig_steps,
         smoothgrad_stdev=smoothgrad_stdev,
         smoothgrad_samples=smoothgrad_samples,
-        ig_smoothgrad_samples=ig_smoothgrad_samples,
         skip_qual=skip_qual,
         use_attention=True,
     )
@@ -853,4 +801,11 @@ def run_mechanistic_pipeline(
         "vit_base_patch16_224", "vit", get_vit_block_names,
         reduce_activation_scales,
         imagenet_root, results_dir, num_images, image_size, batch_size, device,
+        model_kwargs={"img_size": image_size},
+    )
+    run_mechanistic(
+        "vit_base_patch14_dinov2.lvd142m", "dinov2", get_vit_block_names,
+        reduce_activation_scales,
+        imagenet_root, results_dir, num_images, image_size, batch_size, device,
+        model_kwargs={"img_size": image_size, "num_classes": 1000},
     )

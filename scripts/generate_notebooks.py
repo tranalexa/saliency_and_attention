@@ -66,7 +66,7 @@ def resnet_notebook():
         cell_md(
             "# ResNet-50 Cascading Randomization\n\n"
             "PyTorch replication for Adebayo et al. Methods match the original paper: "
-            "Gradient, SmoothGrad, Input-Grad, GBP, GradCAM, GBP-GC, IG, IG-SmoothGrad."
+            "Gradient, SmoothGrad, Input-Grad, GBP, GradCAM, GBP-GC, IG."
         ),
         cell_code(
             IMPORTS
@@ -154,7 +154,11 @@ SKIP_QUAL = False
 
 def mechanistic_notebook():
     return [
-        cell_md("# Mechanistic Checks\n\nLogit correlation and activation scale distributions (ResNet-50 vs ViT-B/16)."),
+        cell_md(
+            "# Mechanistic Checks\n\n"
+            "Logit correlation and activation scale distributions "
+            "(ResNet-50 vs ViT-B/16 vs DINOv2-B)."
+        ),
         cell_code(
             IMPORTS
             + """
@@ -202,34 +206,41 @@ FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 ARCHS = {
     "resnet50": {
         "methods": [
-            "gradient", "smoothgrad", "input_grad", "ig", "ig_smoothgrad", "gradcam",
+            "gradient", "smoothgrad", "input_grad", "ig", "gradcam",
             "gbp", "gbp_gc",
         ],
         "title": "ResNet-50",
     },
     "vit": {
         "methods": [
-            "gradient", "smoothgrad", "input_grad", "ig", "ig_smoothgrad", "gradcam",
+            "gradient", "smoothgrad", "input_grad", "ig", "gradcam",
             "raw_attn", "rollout",
         ],
         "title": "ViT-B/16",
     },
     "dinov2": {
         "methods": [
-            "gradient", "smoothgrad", "input_grad", "ig", "ig_smoothgrad", "gradcam",
+            "gradient", "smoothgrad", "input_grad", "ig", "gradcam",
             "raw_attn", "rollout",
         ],
         "title": "DINOv2-B",
     },
 }
 SHARED_METHODS = [
-    "gradient", "smoothgrad", "input_grad", "ig", "ig_smoothgrad", "gradcam",
+    "gradient", "smoothgrad", "input_grad", "ig", "gradcam",
 ]
 CROSS_ARCH_LABELS = {
     "resnet50": "ResNet-50",
     "vit": "ViT-B/16",
     "dinov2": "DINOv2-B",
 }
+MECH_ARCH_TAGS = [
+    ("resnet", "ResNet-50"),
+    ("vit", "ViT-B/16"),
+    ("dinov2", "DINOv2-B"),
+]
+VIT_ATTENTION_METHODS = ["raw_attn", "rollout"]
+CROSS_VIT_LABELS = {"vit": "ViT-B/16", "dinov2": "DINOv2-B"}
 """
         ),
         cell_code(
@@ -291,10 +302,37 @@ plot_cross_arch_curves("ssim_mean", "SSIM", "cross_arch_ssim.png")
         ),
         cell_code(
             """
+def plot_cross_vit_attention(metric_suffix, ylabel, fname):
+    n_methods = len(VIT_ATTENTION_METHODS)
+    fig, axes = plt.subplots(1, n_methods, figsize=(6 * n_methods, 4), sharey=True)
+    if n_methods == 1:
+        axes = [axes]
+    for ax, method in zip(axes, VIT_ATTENTION_METHODS):
+        for arch, label in CROSS_VIT_LABELS.items():
+            path = RESULTS_ROOT / arch / ("%s_%s.npy" % (method, metric_suffix))
+            if not path.exists():
+                continue
+            vals = np.load(path)
+            ax.plot(range(len(vals)), vals, marker="o", label=label, markersize=3)
+        ax.set_xlabel("Randomization depth")
+        ax.set_ylabel(ylabel)
+        ax.set_title(method)
+        ax.legend(fontsize=7)
+    fig.suptitle("ViT vs DINOv2 attention methods (%s)" % ylabel, y=1.02)
+    plt.tight_layout()
+    plt.savefig(FIGURES_DIR / fname, dpi=150, bbox_inches="tight")
+    plt.show()
+
+plot_cross_vit_attention("spearman_mean", "Spearman correlation", "cross_vit_attn_spearman.png")
+plot_cross_vit_attention("ssim_mean", "SSIM", "cross_vit_attn_ssim.png")
+"""
+        ),
+        cell_code(
+            """
 mech = RESULTS_ROOT / "mechanistic"
-if (mech / "logit_corr_resnet.npy").exists():
-    fig, ax = plt.subplots(figsize=(6, 4))
-    for tag, label in [("resnet", "ResNet-50"), ("vit", "ViT-B/16")]:
+if any((mech / ("logit_corr_%s.npy" % tag)).exists() for tag, _ in MECH_ARCH_TAGS):
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for tag, label in MECH_ARCH_TAGS:
         p = mech / ("logit_corr_%s.npy" % tag)
         if p.exists():
             ax.plot(np.load(p), marker="o", label=label)
@@ -309,7 +347,7 @@ if (mech / "logit_corr_resnet.npy").exists():
         ),
         cell_code(
             """
-for tag in ["resnet", "vit"]:
+for tag, label in MECH_ARCH_TAGS:
     files = sorted(mech.glob("activation_scale_%s_depth*.npy" % tag))
     if len(files) < 2:
         continue
@@ -317,7 +355,7 @@ for tag in ["resnet", "vit"]:
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.hist(a0, bins=50, alpha=0.5, density=True, label="depth 0")
     ax.hist(a1, bins=50, alpha=0.5, density=True, label="depth %d" % (len(files) - 1))
-    ax.set_title("Activation |.| scales: %s" % tag)
+    ax.set_title("Activation |.| scales: %s" % label)
     ax.legend()
     plt.tight_layout()
     plt.savefig(FIGURES_DIR / ("activation_scales_%s.png" % tag), dpi=150)
@@ -363,6 +401,9 @@ plot_cascading_grid("resnet50", "ig", "ResNet-50 IG")
 plot_cascading_grid("vit", "ig", "ViT Integrated Gradients")
 plot_cascading_grid("vit", "input_grad", "ViT Input-Grad")
 plot_cascading_grid("vit", "raw_attn", "ViT raw attention")
+plot_cascading_grid("dinov2", "ig", "DINOv2 Integrated Gradients")
+plot_cascading_grid("dinov2", "input_grad", "DINOv2 Input-Grad")
+plot_cascading_grid("dinov2", "raw_attn", "DINOv2 raw attention")
 plot_cascading_grid("dinov2", "rollout", "DINOv2 rollout")
 print("Figures saved to", FIGURES_DIR)
 """
