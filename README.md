@@ -160,12 +160,18 @@ Outputs: `results/figures/cascade_grid_<arch>.png` (jet heatmap overlaid on the 
 - 224×224 center crop, standard ImageNet normalization
 - Set `IMAGENET_ROOT` in each notebook CONFIG cell (or env var), or upload val to Modal volume `saliency-imagenet`
 
+### Cascading randomization order (Adebayo-style)
+
+Weights are reinitialized **cumulatively** starting at the **classifier** (`fc` / `head` = Logits), then deeper blocks toward the input (ResNet: `Mixed_7c` … `Conv2d_*`; ViT: `TF block 11` … `TF block 0`). Matches the Inception notebook in `notebooks/legacy_tf/inceptionv3_cascading_randomization.ipynb`.
+
+If you have results from an older commit that randomized deep layers first, delete `results/<arch>/*_spearman*.npy` (and related files) and re-run the quant pipeline.
+
 ### Expected qualitative behavior (ResNet replication)
 
 ResNet-50 runs **7 methods** (Gradient, SmoothGrad, Input-Grad, GBP, GradCAM, GBP-GC, IG):
 
-- **Guided Backprop / GBP-GC / Input-Grad**: high SSIM/Spearman when only upper layers are randomized; Input-Grad often stays near 1.0 (strongest sanity-check failure).
-- **Integrated Gradients / Gradient / SmoothGrad / GradCAM**: similarity drops quickly as upper blocks are randomized.
+- **Guided Backprop / GBP-GC / Input-Grad**: high SSIM/Spearman when only the classifier / top layers are randomized; Input-Grad often stays near 1.0 (strongest sanity-check failure).
+- **Integrated Gradients / Gradient / SmoothGrad / GradCAM**: similarity drops quickly as more layers are randomized.
 
 **MNIST** (used in the original paper's Figure 20) is a dataset of 70,000 handwritten digit images (0–9), 28×28 pixels — a classic deep-learning benchmark. The legacy TensorFlow MNIST notebooks live in `notebooks/legacy_tf/`.
 

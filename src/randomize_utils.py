@@ -34,7 +34,7 @@ def reset_layer(model: nn.Module, layer_name: str) -> None:
 
 
 def get_vit_block_names(model: nn.Module) -> List[str]:
-    """Return ViT block names top-to-bottom, then classification head (13 steps)."""
+    """Return cascade order: classifier first, then ViT blocks top-to-bottom (Adebayo-style)."""
     block_indices = set()
     for name, _ in model.named_modules():
         m = re.match(r"blocks\.(\d+)$", name)
@@ -43,16 +43,17 @@ def get_vit_block_names(model: nn.Module) -> List[str]:
     if not block_indices:
         raise ValueError("Could not find ViT blocks in model.")
     max_idx = max(block_indices)
-    order = [f"blocks.{i}" for i in range(max_idx, -1, -1)]
+    order: List[str] = []
     if any(n.startswith("head") for n, _ in model.named_parameters()):
         order.append("head")
     elif any(n.startswith("fc") for n, _ in model.named_parameters()):
         order.append("fc")
+    order.extend(f"blocks.{i}" for i in range(max_idx, -1, -1))
     return order
 
 
 def get_resnet_conv1_names(model: nn.Module) -> List[str]:
-    """Return ResNet Bottleneck conv1 module names, top-to-bottom (stage4 -> stage1)."""
+    """Return cascade order: classifier (fc) first, then Bottleneck conv1 top-to-bottom (Adebayo-style)."""
     conv1_names = []
     for name, module in model.named_modules():
         if name.endswith(".conv1") and isinstance(module, nn.Conv2d):
@@ -67,9 +68,11 @@ def get_resnet_conv1_names(model: nn.Module) -> List[str]:
         return (stage_order.get(layer, 99), -block)
 
     conv1_names.sort(key=sort_key)
+    order: List[str] = []
     if any(n == "fc.weight" or n.startswith("fc.") for n, _ in model.named_parameters()):
-        conv1_names.append("fc")
-    return conv1_names
+        order.append("fc")
+    order.extend(conv1_names)
+    return order
 
 
 def save_checkpoint(model: nn.Module) -> Dict[str, torch.Tensor]:
