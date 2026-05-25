@@ -364,47 +364,46 @@ for tag, label in MECH_ARCH_TAGS:
         ),
         cell_code(
             """
-def plot_cascading_grid(arch, method, title):
+import sys
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from viz_utils import plot_cascade_paper_grid, plot_cascading_grid, select_depth_indices
+
+for arch, cfg in ARCHS.items():
     qual_path = RESULTS_ROOT / arch / "qual_bundle.npz"
     if not qual_path.exists():
-        return
+        print("Skip %s: no qual_bundle.npz (run qual-only Modal job or pipeline with skip_qual=False)" % arch)
+        continue
     data = np.load(qual_path, allow_pickle=True)
-    key = "cascade_" + method
-    if key not in data:
-        return
-    cascade = data[key]
+    img_idx = int(data["image_index"]) if "image_index" in data.files else 0
     order = list(data["order"])
-    nrows = len(cascade) + 2
-    fig = plt.figure(figsize=(4, 0.4 * nrows))
-    gs = gridspec.GridSpec(nrows, 1)
-    ax = fig.add_subplot(gs[0])
-    ax.imshow(data["image"])
-    ax.set_title("Input")
-    ax.axis("off")
-    ax = fig.add_subplot(gs[1])
-    ax.imshow(data["baseline_" + method], cmap="gray")
-    ax.set_title("Baseline (no randomization)")
-    ax.axis("off")
-    for i, m in enumerate(cascade):
-        ax = fig.add_subplot(gs[i + 2])
-        ax.imshow(m, cmap="gray")
-        ax.set_title("Depth %d: %s" % (i, order[i] if i < len(order) else ""))
-        ax.axis("off")
-    fig.suptitle(title)
-    plt.tight_layout()
-    plt.savefig(FIGURES_DIR / ("cascade_%s_%s.png" % (arch, method)), dpi=150)
-    plt.show()
+    depth_indices = select_depth_indices(len(order))
+    plot_cascade_paper_grid(
+        qual_path,
+        cfg["methods"],
+        depth_indices=depth_indices,
+        out_path=FIGURES_DIR / ("cascade_grid_%s.png" % arch),
+        title=cfg["title"] + " cascading randomization (image %d)" % img_idx,
+        show=True,
+    )
+    print("%s paper grid -> cascade_grid_%s.png (image_index=%d)" % (arch, arch, img_idx))
 
-plot_cascading_grid("resnet50", "gbp", "ResNet-50 GBP (Adebayo replication check)")
-plot_cascading_grid("resnet50", "input_grad", "ResNet-50 Input-Grad")
-plot_cascading_grid("resnet50", "ig", "ResNet-50 IG")
-plot_cascading_grid("vit", "ig", "ViT Integrated Gradients")
-plot_cascading_grid("vit", "input_grad", "ViT Input-Grad")
-plot_cascading_grid("vit", "raw_attn", "ViT raw attention")
-plot_cascading_grid("dinov2", "ig", "DINOv2 Integrated Gradients")
-plot_cascading_grid("dinov2", "input_grad", "DINOv2 Input-Grad")
-plot_cascading_grid("dinov2", "raw_attn", "DINOv2 raw attention")
-plot_cascading_grid("dinov2", "rollout", "DINOv2 rollout")
+# Optional per-method vertical strips for slides
+for arch, method, title in [
+    ("resnet50", "gbp", "ResNet-50 GBP"),
+    ("resnet50", "input_grad", "ResNet-50 Input-Grad"),
+    ("resnet50", "ig", "ResNet-50 IG"),
+    ("vit", "ig", "ViT IG"),
+    ("vit", "raw_attn", "ViT raw attention"),
+    ("dinov2", "ig", "DINOv2 IG"),
+]:
+    plot_cascading_grid(
+        RESULTS_ROOT / arch / "qual_bundle.npz",
+        method,
+        out_path=FIGURES_DIR / ("cascade_%s_%s.png" % (arch, method)),
+        title=title,
+        show=False,
+    )
+
 print("Figures saved to", FIGURES_DIR)
 """
         ),

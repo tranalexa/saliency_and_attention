@@ -101,6 +101,10 @@ modal run modal/app.py --experiment mechanistic --num-images 500
 
 # All pipelines in parallel (up to ~22 GPUs with parallel methods — expensive)
 modal run modal/app.py --experiment all --num-images 500 --skip-qual --parallel-methods
+
+# Paper cascade figures only (after quant run + download, or results on volume):
+modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim
+modal run modal/app.py --experiment resnet50 --qual-only --image-index-mode fixed --image-index 0
 ```
 
 ### CLI flags
@@ -110,7 +114,11 @@ modal run modal/app.py --experiment all --num-images 500 --skip-qual --parallel-
 | `--experiment` | `resnet50` | `resnet50`, `vit`, `dinov2`, `mechanistic`, or `all` |
 | `--num-images` | `500` | Number of ImageNet val images (use `10` for testing) |
 | `--batch-size` | `8` | Batch size (mechanistic uses `16`) |
-| `--skip-qual` | false | Skip qualitative `qual_bundle.npz` generation |
+| `--skip-qual` | false | Skip qualitative `qual_bundle.npz` during quant runs |
+| `--qual-only` | false | Only build `qual_bundle.npz` (no Spearman/SSIM recompute) |
+| `--image-index` | `0` | Demo image index when `--image-index-mode fixed` |
+| `--image-index-mode` | `fixed` | `fixed` or `auto_ssim` (pick image with largest SSIM drop; needs `*_ssim.npy` on volume) |
+| `--qual-force` | false | Overwrite existing `qual_bundle.npz` |
 | `--parallel-methods` | true | Spawn one GPU job per saliency method (ResNet/ViT/DINO) |
 | `--sequential` | false | Run the full pipeline on a single GPU (disables parallel methods) |
 
@@ -150,7 +158,12 @@ Then run the analysis notebook locally (no GPU):
 jupyter notebook notebooks/notebook_analysis.ipynb
 ```
 
-Figures are saved to `results/figures/`.
+Figures are saved to `results/figures/`:
+
+- `cascade_grid_resnet50.png`, `cascade_grid_vit.png`, `cascade_grid_dinov2.png` — Adebayo-style method × depth grids (requires `qual_bundle.npz`)
+- `cascade_<arch>_<method>.png` — optional vertical strips per method
+
+**Qual workflow:** Use `--skip-qual` for the 500-image quant job, then `--qual-only` (cheap). With `--parallel-methods` and `skip_qual=false`, qual runs automatically **after** all method jobs finish for that architecture. Do not rely on per-method workers to build qual bundles.
 
 ## Volumes summary
 

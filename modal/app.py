@@ -5,6 +5,7 @@ Usage (from repo root):
   modal run modal/app.py --experiment resnet50 --num-images 500 --skip-qual
   modal run modal/app.py --experiment all --num-images 500 --skip-qual --parallel-methods
   modal run modal/app.py --experiment resnet50 --num-images 10 --sequential
+  modal run modal/app.py --experiment resnet50 --qual-only --image-index-mode auto_ssim
 """
 from __future__ import annotations
 
@@ -96,7 +97,6 @@ def _run_single_method(
     method: str,
     num_images: int,
     batch_size: int,
-    skip_qual: bool,
 ):
     import sys
 
@@ -111,8 +111,27 @@ def _run_single_method(
         num_images=num_images,
         batch_size=batch_size,
         device="cuda",
-        skip_qual=skip_qual,
     )
+    results_vol.commit()
+
+
+def _run_qual(arch: str, num_images: int, image_index: int, image_index_mode: str, force: bool):
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    from experiment_utils import run_qual_bundle_pipeline
+
+    idx = run_qual_bundle_pipeline(
+        arch=arch,
+        imagenet_root=Path(IMAGENET_MOUNT),
+        results_dir=Path(RESULTS_MOUNT) / arch,
+        num_images=num_images,
+        device="cuda",
+        image_index=image_index,
+        image_index_mode=image_index_mode,
+        force=force,
+    )
+    print("qual_bundle for %s written (image_index=%d)" % (arch, idx))
     results_vol.commit()
 
 
@@ -162,14 +181,29 @@ def run_mechanistic(num_images: int = 500, batch_size: int = 16, skip_qual: bool
     timeout=TIMEOUT_SEC,
     volumes=volume_mounts,
 )
+def run_qual_bundle(
+    arch: str,
+    num_images: int = 500,
+    image_index: int = 0,
+    image_index_mode: str = "fixed",
+    force: bool = False,
+):
+    _run_qual(arch, num_images, image_index, image_index_mode, force)
+
+
+@app.function(
+    image=image,
+    gpu=GPU_TYPE,
+    timeout=TIMEOUT_SEC,
+    volumes=volume_mounts,
+)
 def run_saliency_method(
     arch: str,
     method: str,
     num_images: int = 500,
     batch_size: int = 8,
-    skip_qual: bool = True,
 ):
-    _run_single_method(arch, method, num_images, batch_size, skip_qual)
+    _run_single_method(arch, method, num_images, batch_size)
 
 
 def _methods_for_arch(arch: str) -> list[str]:
@@ -185,7 +219,6 @@ def _launch_arch_parallel(
     arch: str,
     num_images: int,
     batch_size: int,
-    skip_qual: bool,
 ) -> list:
     methods = _methods_for_arch(arch)
     print("Launching %d parallel method jobs for %s: %s" % (len(methods), arch, methods))
@@ -195,7 +228,6 @@ def _launch_arch_parallel(
             method=method,
             num_images=num_images,
             batch_size=batch_size,
-            skip_qual=skip_qual,
         )
         for method in methods
     ]
@@ -207,6 +239,19 @@ def _wait_handles(handles: list) -> None:
         handle.get()
 
 
+def _launch_qual(arch: str, num_images: int, image_index: int, image_index_mode: str, force: bool) -> list:
+    print("Launching qual_bundle job for", arch)
+    return [
+        run_qual_bundle.spawn(
+            arch=arch,
+            num_images=num_images,
+            image_index=image_index,
+            image_index_mode=image_index_mode,
+            force=force,
+        )
+    ]
+
+
 @app.local_entrypoint()
 def main(
     experiment: str = "resnet50",
@@ -215,11 +260,17 @@ def main(
     skip_qual: bool = False,
     parallel_methods: bool = True,
     sequential: bool = False,
+    qual_only: bool = False,
+    image_index: int = 0,
+    image_index_mode: str = "fixed",
+    qual_force: bool = False,
 ):
     """
     experiment: resnet50 | vit | dinov2 | mechanistic | all
-  parallel_methods: one GPU per saliency method (default on)
-  sequential: run full pipeline on a single GPU (opt-out of parallel_methods)
+    parallel_methods: one GPU per saliency method (default on)
+    sequential: run full pipeline on a single GPU (opt-out of parallel_methods)
+    qual_only: only build qual_bundle.npz (no quant recompute)
+    image_index_mode: fixed | auto_ssim (pick demo image from existing SSIM arrays)
     """
     use_parallel_methods = parallel_methods and not sequential
 
@@ -230,12 +281,38 @@ def main(
         "mechanistic": run_mechanistic,
     }
 
+    def qual_archs_for_experiment(name: str) -> list[str]:
+        if name == "all":
+            return list(SALIENCY_ARCHS)
+        if name in SALIENCY_ARCHS:
+            return [name]
+        return []
+
+    if qual_only:
+        archs = qual_archs_for_experiment(experiment)
+        if not archs:
+            raise ValueError(
+                "qual_only requires experiment resnet50|vit|dinov2|all (not mechanistic)"
+            )
+        handles = []
+        for arch in archs:
+            handles.extend(
+                _launch_qual(arch, num_images, image_index, image_index_mode, qual_force)
+            )
+        _wait_handles(handles)
+        return
+
     def launch_arch(name: str) -> list:
         if name == "mechanistic" or not use_parallel_methods:
             bs = 16 if name == "mechanistic" else batch_size
             print("Launching sequential job:", name)
             return [experiments[name].spawn(num_images=num_images, batch_size=bs, skip_qual=skip_qual)]
-        return _launch_arch_parallel(name, num_images, batch_size, skip_qual)
+
+        method_handles = _launch_arch_parallel(name, num_images, batch_size)
+        if skip_qual or name not in SALIENCY_ARCHS:
+            return method_handles
+        _wait_handles(method_handles)
+        return _launch_qual(name, num_images, image_index, image_index_mode, qual_force)
 
     if experiment == "all":
         all_handles = []

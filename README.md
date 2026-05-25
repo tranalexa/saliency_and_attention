@@ -119,6 +119,7 @@ Legacy TensorFlow replication notebooks live in `notebooks/legacy_tf/`.
 - `experiment_utils.py` — full pipelines (data loading, Captum, cascading, mechanistic); used by notebooks and Modal
 - `randomize_utils.py` — cascading weight reset (`reset_layer`, checkpoints, layer orders)
 - `metrics_utils.py` — Spearman, SSIM, logit Pearson correlation, map normalization
+- `viz_utils.py` — Adebayo-style cascade figure grids (`qual_bundle.npz` → paper PNGs)
 - `attention_utils.py` — raw attention & rollout (Abnar & Zuidema 2020)
 
 ### Running on Modal (cloud GPU)
@@ -139,6 +140,19 @@ jupyter notebook notebooks/notebook_analysis.ipynb
 ```
 
 Uses **NVIDIA A10G** by default. Full 500-image runs are expensive; always smoke-test with `--num-images 10` first.
+
+### Qualitative cascade figures (paper)
+
+Quant runs can use `--skip-qual` (faster). Build `qual_bundle.npz` afterward (one GPU per architecture, all methods):
+
+```bash
+modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim
+# Or Adebayo default (first val image): --image-index-mode fixed --image-index 0
+./scripts/download_modal_results.sh
+jupyter notebook notebooks/notebook_analysis.ipynb
+```
+
+Outputs: `results/figures/cascade_grid_<arch>.png` (rows = methods, cols = baseline + cascade depths). Legacy Adebayo layout is documented in `notebooks/legacy_tf/inceptionv3_cascading_randomization.ipynb`.
 
 ### Dataset
 

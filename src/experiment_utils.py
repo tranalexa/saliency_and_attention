@@ -17,6 +17,7 @@ import timm
 
 from attention_utils import get_raw_attention, get_rollout
 from metrics_utils import abs_grayscale_norm, compute_logit_correlation, compute_spearman, compute_ssim
+from viz_utils import pick_qual_image_index
 from randomize_utils import (
     get_resnet_conv1_names,
     get_vit_block_names,
@@ -396,6 +397,13 @@ def run_cascading_experiment(
         np.save(results_dir / ("%s_ssim_mean.npy" % method), np.nanmean(ssim_all, axis=1))
 
 
+def _qual_has_all_methods(qual_path: Path, methods: Sequence[str]) -> bool:
+    if not qual_path.exists():
+        return False
+    data = np.load(qual_path, allow_pickle=True)
+    return all(("baseline_" + m) in data.files and ("cascade_" + m) in data.files for m in methods)
+
+
 def build_qual_bundle(
     model: nn.Module,
     order: List[str],
@@ -404,19 +412,40 @@ def build_qual_bundle(
     compute_fn: Callable[[str, torch.Tensor, torch.Tensor], np.ndarray],
     results_dir: Path,
     device: str,
+    image_index: int = 0,
+    force: bool = False,
 ) -> None:
     qual_path = results_dir / "qual_bundle.npz"
-    if qual_path.exists():
+    methods = list(methods)
+    existing: dict = {}
+    if qual_path.exists() and not force:
+        data = np.load(qual_path, allow_pickle=True)
+        if _qual_has_all_methods(qual_path, methods):
+            if "image_index" in data.files and int(data["image_index"]) == image_index:
+                return
+        existing = {k: data[k] for k in data.files}
+        if "image_index" in existing and int(existing["image_index"]) != image_index:
+            force = True
+            existing = {}
+
+    methods_to_compute = methods if force else [m for m in methods if ("baseline_" + m) not in existing]
+    if not methods_to_compute and existing and not force:
         return
+
     original_sd = save_checkpoint(model)
-    img, _ = dataset[0]
+    img, _ = dataset[image_index]
     inp = img[None].to(device)
     tgt = get_target_indices(model, inp)
-    out = {
-        "image": denormalize(inp).squeeze(0).permute(1, 2, 0).cpu().numpy(),
-        "order": np.array(order, dtype=object),
-    }
-    for method in methods:
+    out = dict(existing) if existing and not force else {}
+    out.update(
+        {
+            "image": denormalize(inp).squeeze(0).permute(1, 2, 0).cpu().numpy(),
+            "order": np.array(order, dtype=object),
+            "image_index": np.int64(image_index),
+            "target_index": np.int64(int(tgt[0].item())),
+        }
+    )
+    for method in methods_to_compute:
         out["baseline_" + method] = compute_fn(method, inp, tgt)[0]
         cascade = []
         for depth in range(len(order)):
@@ -426,6 +455,123 @@ def build_qual_bundle(
             cascade.append(compute_fn(method, inp, tgt)[0])
         out["cascade_" + method] = np.stack(cascade)
     np.savez_compressed(qual_path, **out)
+
+
+def _setup_arch_model(
+    arch: str,
+    imagenet_root: Path,
+    num_images: int,
+    image_size: int,
+    device: str,
+    ig_steps: int,
+    smoothgrad_stdev: float,
+    smoothgrad_samples: int,
+) -> Tuple[nn.Module, List[str], Subset, Callable[[str, torch.Tensor, torch.Tensor], np.ndarray], List[str]]:
+    """Load model, dataset subset, and saliency compute_fn for an architecture."""
+    transform = build_transform(image_size)
+    dataset, _ = load_imagenet_subset(imagenet_root, num_images, transform=transform)
+
+    if arch == "resnet50":
+        model = timm.create_model("resnet50", pretrained=True).to(device).eval()
+        order = get_resnet_conv1_names(model)
+        gradcam_layer = model.layer4[-1].conv3
+        methods = list(RESNET50_SALIENCY_METHODS)
+        compute_fn = make_saliency_compute_fn(
+            model,
+            gradcam_layer,
+            ig_steps=ig_steps,
+            smoothgrad_stdev=smoothgrad_stdev,
+            smoothgrad_samples=smoothgrad_samples,
+        )
+    elif arch == "vit":
+        model_name = "vit_base_patch16_224"
+        grid_size = 14
+        model = timm.create_model(model_name, pretrained=True, img_size=image_size).to(device).eval()
+        order = get_vit_block_names(model)
+        gradcam_layer = model.patch_embed.proj
+        methods = list(VIT_SALIENCY_METHODS)
+        compute_fn = make_saliency_compute_fn(
+            model,
+            gradcam_layer,
+            grid_size=grid_size,
+            ig_steps=ig_steps,
+            smoothgrad_stdev=smoothgrad_stdev,
+            smoothgrad_samples=smoothgrad_samples,
+            attention_grid_size=grid_size,
+        )
+    elif arch == "dinov2":
+        model_name = "vit_base_patch14_dinov2.lvd142m"
+        grid_size = 16
+        model = timm.create_model(
+            model_name, pretrained=True, img_size=image_size, num_classes=1000
+        ).to(device).eval()
+        order = get_vit_block_names(model)
+        gradcam_layer = model.patch_embed.proj
+        methods = list(VIT_SALIENCY_METHODS)
+        compute_fn = make_saliency_compute_fn(
+            model,
+            gradcam_layer,
+            grid_size=grid_size,
+            ig_steps=ig_steps,
+            smoothgrad_stdev=smoothgrad_stdev,
+            smoothgrad_samples=smoothgrad_samples,
+            attention_grid_size=grid_size,
+        )
+    else:
+        raise ValueError("Unknown arch: %s (use resnet50|vit|dinov2)" % arch)
+    return model, order, dataset, compute_fn, methods
+
+
+def run_qual_bundle_pipeline(
+    arch: str,
+    imagenet_root: Path,
+    results_dir: Path,
+    num_images: int = 500,
+    image_size: int = 224,
+    device: str = "cuda",
+    ig_steps: int = 50,
+    smoothgrad_stdev: float = 0.15,
+    smoothgrad_samples: int = 25,
+    image_index: int = 0,
+    image_index_mode: str = "fixed",
+    auto_ssim_method: str = "ig",
+    force: bool = False,
+) -> int:
+    """Build qual_bundle.npz for paper cascade figures. Returns image index used."""
+    if arch not in ARCH_SALIENCY_METHODS:
+        raise ValueError("Unknown arch: %s" % arch)
+    validate_imagenet_root(imagenet_root)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    if image_index_mode == "auto_ssim":
+        image_index = pick_qual_image_index(
+            results_dir, method=auto_ssim_method, fallback=image_index
+        )
+    elif image_index_mode != "fixed":
+        raise ValueError("image_index_mode must be 'fixed' or 'auto_ssim'")
+
+    model, order, dataset, compute_fn, methods = _setup_arch_model(
+        arch,
+        imagenet_root,
+        num_images,
+        image_size,
+        device,
+        ig_steps,
+        smoothgrad_stdev,
+        smoothgrad_samples,
+    )
+    build_qual_bundle(
+        model,
+        order,
+        dataset,
+        methods,
+        compute_fn,
+        results_dir,
+        device,
+        image_index=image_index,
+        force=force,
+    )
+    return image_index
 
 
 def reduce_activation_scales(t: torch.Tensor) -> torch.Tensor:
@@ -585,7 +731,6 @@ def run_arch_method_pipeline(
     ig_steps: int = 50,
     smoothgrad_stdev: float = 0.15,
     smoothgrad_samples: int = 25,
-    skip_qual: bool = True,
 ) -> None:
     """Run cascading sanity check for a single architecture + method (parallel Modal workers)."""
     if arch not in ARCH_SALIENCY_METHODS:
@@ -655,10 +800,6 @@ def run_arch_method_pipeline(
     run_cascading_experiment(
         model, order, all_images, all_targets, [method], compute_fn, results_dir, batch_size, device
     )
-    if not skip_qual:
-        build_qual_bundle(
-            model, order, dataset, [method], compute_fn, results_dir, device
-        )
 
 
 def run_resnet50_pipeline(
