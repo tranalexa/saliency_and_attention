@@ -121,12 +121,17 @@ modal run modal/app.py --experiment resnet50 --qual-only --image-index-mode fixe
 | `--qual-force` | false | Overwrite existing `qual_bundle.npz` |
 | `--parallel-methods` | true | Spawn one GPU job per saliency method (ResNet/ViT/DINO) |
 | `--sequential` | false | Run the full pipeline on a single GPU (disables parallel methods) |
+| `--force-recompute` | false | Recompute baselines and Spearman/SSIM even if outputs already exist |
+| `--target-mode` | `dynamic` | `dynamic` (per-depth argmax) or `frozen_baseline` |
+| `--seed` | `42` | RNG seed for weight re-init and dataloading |
 
 **Parallelism:** `--parallel-methods` (default) launches one A10G per saliency method. Wall-clock drops roughly 6–7× per architecture; total GPU-hours is similar, but you pay for concurrent GPUs. Use `--sequential` for cheap debugging. `--experiment all` with parallel methods can use up to ~22 GPUs at once (7 methods × 3 archs + mechanistic).
 
 Results are written to the **`saliency-results`** volume under `/<arch>/` (e.g. `/resnet50/`). Inside the container these appear at `/results/<arch>/` because the volume is mounted at `/results`.
 
 Jobs skip work when output files already exist (same as local notebooks).
+
+**After code changes:** delete stale artifacts on the volume (or locally) and pass `--force-recompute` for a full rerun. See [experimental_protocol.md](experimental_protocol.md).
 
 ## 3. Download results for analysis
 

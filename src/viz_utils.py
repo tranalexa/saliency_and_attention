@@ -50,7 +50,7 @@ def format_resnet_adebayo_label(layer_name: str) -> str:
     name = str(layer_name)
     if name == "fc":
         return "Logits"
-    m = re.match(r"layer(\d+)\.(\d+)\.conv1$", name)
+    m = re.match(r"layer(\d+)\.(\d+)(?:\.conv1)?$", name)
     if not m:
         return short_layer_label(name)
     stage, block = int(m.group(1)), int(m.group(2))
@@ -69,7 +69,7 @@ def infer_arch_family(order: Sequence[str]) -> str:
         if re.match(r"blocks\.\d+$", str(name)):
             return ARCH_FAMILY_TRANSFORMER
     for name in order:
-        if re.match(r"layer\d+\.\d+\.conv1$", str(name)):
+        if re.match(r"layer\d+\.\d+", str(name)):
             return ARCH_FAMILY_CNN
     if order and str(order[0]).startswith("layer"):
         return ARCH_FAMILY_CNN

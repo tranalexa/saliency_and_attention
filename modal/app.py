@@ -40,7 +40,17 @@ volume_mounts = {IMAGENET_MOUNT: imagenet_vol, RESULTS_MOUNT: results_vol}
 SALIENCY_ARCHS = ("resnet50", "vit", "dinov2")
 
 
-def _run_pipeline(fn_name: str, results_subdir: str, num_images: int, batch_size: int, skip_qual: bool, **kwargs):
+def _run_pipeline(
+    fn_name: str,
+    results_subdir: str,
+    num_images: int,
+    batch_size: int,
+    skip_qual: bool,
+    force_recompute: bool = False,
+    target_mode: str = "dynamic",
+    seed: int = 42,
+    **kwargs,
+):
     import sys
 
     sys.path.insert(0, "/root/src")
@@ -59,8 +69,21 @@ def _run_pipeline(fn_name: str, results_subdir: str, num_images: int, batch_size
     }
     fn = fns[fn_name]
     results_dir = Path(RESULTS_MOUNT) / results_subdir
+    pipe_kw = dict(
+        force_recompute=force_recompute,
+        target_mode=target_mode,
+        seed=seed,
+    )
     if fn_name == "mechanistic":
-        fn(imagenet_root=Path(IMAGENET_MOUNT), results_dir=results_dir, num_images=num_images, batch_size=batch_size, device="cuda")
+        fn(
+            imagenet_root=Path(IMAGENET_MOUNT),
+            results_dir=results_dir,
+            num_images=num_images,
+            batch_size=batch_size,
+            device="cuda",
+            force_recompute=force_recompute,
+            seed=seed,
+        )
     elif fn_name == "vit":
         fn(
             imagenet_root=Path(IMAGENET_MOUNT),
@@ -69,6 +92,7 @@ def _run_pipeline(fn_name: str, results_subdir: str, num_images: int, batch_size
             batch_size=batch_size,
             device="cuda",
             skip_qual=skip_qual,
+            **pipe_kw,
             **kwargs,
         )
     elif fn_name == "dinov2":
@@ -79,6 +103,7 @@ def _run_pipeline(fn_name: str, results_subdir: str, num_images: int, batch_size
             batch_size=batch_size,
             device="cuda",
             skip_qual=skip_qual,
+            **pipe_kw,
         )
     else:
         fn(
@@ -88,6 +113,7 @@ def _run_pipeline(fn_name: str, results_subdir: str, num_images: int, batch_size
             batch_size=batch_size,
             device="cuda",
             skip_qual=skip_qual,
+            **pipe_kw,
         )
     results_vol.commit()
 
@@ -97,6 +123,9 @@ def _run_single_method(
     method: str,
     num_images: int,
     batch_size: int,
+    force_recompute: bool = False,
+    target_mode: str = "dynamic",
+    seed: int = 42,
 ):
     import sys
 
@@ -111,11 +140,22 @@ def _run_single_method(
         num_images=num_images,
         batch_size=batch_size,
         device="cuda",
+        force_recompute=force_recompute,
+        target_mode=target_mode,
+        seed=seed,
     )
     results_vol.commit()
 
 
-def _run_qual(arch: str, num_images: int, image_index: int, image_index_mode: str, force: bool):
+def _run_qual(
+    arch: str,
+    num_images: int,
+    image_index: int,
+    image_index_mode: str,
+    force: bool,
+    target_mode: str = "dynamic",
+    seed: int = 42,
+):
     import sys
 
     sys.path.insert(0, "/root/src")
@@ -130,6 +170,8 @@ def _run_qual(arch: str, num_images: int, image_index: int, image_index_mode: st
         image_index=image_index,
         image_index_mode=image_index_mode,
         force=force,
+        target_mode=target_mode,
+        seed=seed,
     )
     print("qual_bundle for %s written (image_index=%d)" % (arch, idx))
     results_vol.commit()
@@ -141,8 +183,18 @@ def _run_qual(arch: str, num_images: int, image_index: int, image_index_mode: st
     timeout=TIMEOUT_SEC,
     volumes=volume_mounts,
 )
-def run_resnet50(num_images: int = 500, batch_size: int = 8, skip_qual: bool = False):
-    _run_pipeline("resnet50", "resnet50", num_images, batch_size, skip_qual)
+def run_resnet50(
+    num_images: int = 500,
+    batch_size: int = 8,
+    skip_qual: bool = False,
+    force_recompute: bool = False,
+    target_mode: str = "dynamic",
+    seed: int = 42,
+):
+    _run_pipeline(
+        "resnet50", "resnet50", num_images, batch_size, skip_qual,
+        force_recompute=force_recompute, target_mode=target_mode, seed=seed,
+    )
 
 
 @app.function(
@@ -151,8 +203,18 @@ def run_resnet50(num_images: int = 500, batch_size: int = 8, skip_qual: bool = F
     timeout=TIMEOUT_SEC,
     volumes=volume_mounts,
 )
-def run_vit(num_images: int = 500, batch_size: int = 8, skip_qual: bool = False):
-    _run_pipeline("vit", "vit", num_images, batch_size, skip_qual)
+def run_vit(
+    num_images: int = 500,
+    batch_size: int = 8,
+    skip_qual: bool = False,
+    force_recompute: bool = False,
+    target_mode: str = "dynamic",
+    seed: int = 42,
+):
+    _run_pipeline(
+        "vit", "vit", num_images, batch_size, skip_qual,
+        force_recompute=force_recompute, target_mode=target_mode, seed=seed,
+    )
 
 
 @app.function(
@@ -161,8 +223,18 @@ def run_vit(num_images: int = 500, batch_size: int = 8, skip_qual: bool = False)
     timeout=TIMEOUT_SEC,
     volumes=volume_mounts,
 )
-def run_dinov2(num_images: int = 500, batch_size: int = 8, skip_qual: bool = False):
-    _run_pipeline("dinov2", "dinov2", num_images, batch_size, skip_qual)
+def run_dinov2(
+    num_images: int = 500,
+    batch_size: int = 8,
+    skip_qual: bool = False,
+    force_recompute: bool = False,
+    target_mode: str = "dynamic",
+    seed: int = 42,
+):
+    _run_pipeline(
+        "dinov2", "dinov2", num_images, batch_size, skip_qual,
+        force_recompute=force_recompute, target_mode=target_mode, seed=seed,
+    )
 
 
 @app.function(
@@ -171,8 +243,17 @@ def run_dinov2(num_images: int = 500, batch_size: int = 8, skip_qual: bool = Fal
     timeout=TIMEOUT_SEC,
     volumes=volume_mounts,
 )
-def run_mechanistic(num_images: int = 500, batch_size: int = 16, skip_qual: bool = False):
-    _run_pipeline("mechanistic", "mechanistic", num_images, batch_size, skip_qual)
+def run_mechanistic(
+    num_images: int = 500,
+    batch_size: int = 16,
+    skip_qual: bool = False,
+    force_recompute: bool = False,
+    seed: int = 42,
+):
+    _run_pipeline(
+        "mechanistic", "mechanistic", num_images, batch_size, skip_qual,
+        force_recompute=force_recompute, seed=seed,
+    )
 
 
 @app.function(
@@ -187,8 +268,10 @@ def run_qual_bundle(
     image_index: int = 0,
     image_index_mode: str = "fixed",
     force: bool = False,
+    target_mode: str = "dynamic",
+    seed: int = 42,
 ):
-    _run_qual(arch, num_images, image_index, image_index_mode, force)
+    _run_qual(arch, num_images, image_index, image_index_mode, force, target_mode, seed)
 
 
 @app.function(
@@ -219,6 +302,9 @@ def _launch_arch_parallel(
     arch: str,
     num_images: int,
     batch_size: int,
+    force_recompute: bool = False,
+    target_mode: str = "dynamic",
+    seed: int = 42,
 ) -> list:
     methods = _methods_for_arch(arch)
     print("Launching %d parallel method jobs for %s: %s" % (len(methods), arch, methods))
@@ -228,6 +314,9 @@ def _launch_arch_parallel(
             method=method,
             num_images=num_images,
             batch_size=batch_size,
+            force_recompute=force_recompute,
+            target_mode=target_mode,
+            seed=seed,
         )
         for method in methods
     ]
@@ -239,7 +328,15 @@ def _wait_handles(handles: list) -> None:
         handle.get()
 
 
-def _launch_qual(arch: str, num_images: int, image_index: int, image_index_mode: str, force: bool) -> list:
+def _launch_qual(
+    arch: str,
+    num_images: int,
+    image_index: int,
+    image_index_mode: str,
+    force: bool,
+    target_mode: str = "dynamic",
+    seed: int = 42,
+) -> list:
     print("Launching qual_bundle job for", arch)
     return [
         run_qual_bundle.spawn(
@@ -248,6 +345,8 @@ def _launch_qual(arch: str, num_images: int, image_index: int, image_index_mode:
             image_index=image_index,
             image_index_mode=image_index_mode,
             force=force,
+            target_mode=target_mode,
+            seed=seed,
         )
     ]
 
@@ -264,6 +363,9 @@ def main(
     image_index: int = 0,
     image_index_mode: str = "fixed",
     qual_force: bool = False,
+    force_recompute: bool = False,
+    target_mode: str = "dynamic",
+    seed: int = 42,
 ):
     """
     experiment: resnet50 | vit | dinov2 | mechanistic | all
@@ -271,6 +373,8 @@ def main(
     sequential: run full pipeline on a single GPU (opt-out of parallel_methods)
     qual_only: only build qual_bundle.npz (no quant recompute)
     image_index_mode: fixed | auto_ssim (pick demo image from existing SSIM arrays)
+    force_recompute: ignore cached spearman/baseline npy (full rerun)
+    target_mode: dynamic (per-depth argmax) | frozen_baseline
     """
     use_parallel_methods = parallel_methods and not sequential
 
@@ -297,7 +401,10 @@ def main(
         handles = []
         for arch in archs:
             handles.extend(
-                _launch_qual(arch, num_images, image_index, image_index_mode, qual_force)
+                _launch_qual(
+                    arch, num_images, image_index, image_index_mode, qual_force,
+                    target_mode=target_mode, seed=seed,
+                )
             )
         _wait_handles(handles)
         return
@@ -306,13 +413,27 @@ def main(
         if name == "mechanistic" or not use_parallel_methods:
             bs = 16 if name == "mechanistic" else batch_size
             print("Launching sequential job:", name)
-            return [experiments[name].spawn(num_images=num_images, batch_size=bs, skip_qual=skip_qual)]
+            return [
+                experiments[name].spawn(
+                    num_images=num_images,
+                    batch_size=bs,
+                    skip_qual=skip_qual,
+                    force_recompute=force_recompute,
+                    target_mode=target_mode,
+                    seed=seed,
+                )
+            ]
 
-        method_handles = _launch_arch_parallel(name, num_images, batch_size)
+        method_handles = _launch_arch_parallel(
+            name, num_images, batch_size, force_recompute, target_mode, seed
+        )
         if skip_qual or name not in SALIENCY_ARCHS:
             return method_handles
         _wait_handles(method_handles)
-        return _launch_qual(name, num_images, image_index, image_index_mode, qual_force)
+        return _launch_qual(
+            name, num_images, image_index, image_index_mode, qual_force,
+            target_mode=target_mode, seed=seed,
+        )
 
     if experiment == "all":
         all_handles = []

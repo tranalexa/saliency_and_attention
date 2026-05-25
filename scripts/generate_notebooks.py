@@ -245,6 +245,20 @@ CROSS_VIT_LABELS = {"vit": "ViT-B/16", "dinov2": "DINOv2-B"}
         ),
         cell_code(
             """
+def _load_order(arch):
+    order_path = RESULTS_ROOT / arch / "randomization_order.json"
+    if order_path.exists():
+        with open(order_path) as f:
+            return json.load(f)
+    return None
+
+
+def _fraction_x(n_depths):
+    if n_depths <= 1:
+        return np.array([0.0])
+    return np.arange(n_depths) / float(n_depths - 1)
+
+
 def plot_metric_curves(metric_suffix, ylabel, fname):
     fig, axes = plt.subplots(1, 3, figsize=(16, 4), sharey=True)
     for ax, (arch, cfg) in zip(axes, ARCHS.items()):
@@ -252,13 +266,15 @@ def plot_metric_curves(metric_suffix, ylabel, fname):
         if not d.exists():
             ax.set_title(cfg["title"] + " (missing)")
             continue
+        order = _load_order(arch)
         for method in cfg["methods"]:
             path = d / ("%s_%s.npy" % (method, metric_suffix))
             if not path.exists():
                 continue
             vals = np.load(path)
-            ax.plot(range(len(vals)), vals, marker="o", label=method, markersize=3)
-        ax.set_xlabel("Randomization depth")
+            x = _fraction_x(len(vals))
+            ax.plot(x, vals, marker="o", label=method, markersize=3)
+        ax.set_xlabel("Fraction of cascade randomized")
         ax.set_ylabel(ylabel)
         ax.set_title(cfg["title"])
         ax.legend(fontsize=6, ncol=2)
@@ -284,8 +300,9 @@ def plot_cross_arch_curves(metric_suffix, ylabel, fname):
             if not path.exists():
                 continue
             vals = np.load(path)
-            ax.plot(range(len(vals)), vals, marker="o", label=label, markersize=3)
-        ax.set_xlabel("Randomization depth")
+            x = _fraction_x(len(vals))
+            ax.plot(x, vals, marker="o", label=label, markersize=3)
+        ax.set_xlabel("Fraction of cascade randomized")
         ax.set_ylabel(ylabel)
         ax.set_title(method)
         ax.legend(fontsize=7)
@@ -302,6 +319,35 @@ plot_cross_arch_curves("ssim_mean", "SSIM", "cross_arch_ssim.png")
         ),
         cell_code(
             """
+# Diverging-norm metrics (Input-Grad / GBP often differ from abs)
+def plot_metric_curves_div(metric_suffix, ylabel, fname):
+    suffix = metric_suffix.replace("_mean", "_div_mean")
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4), sharey=True)
+    for ax, (arch, cfg) in zip(axes, ARCHS.items()):
+        d = RESULTS_ROOT / arch
+        if not d.exists():
+            continue
+        for method in cfg["methods"]:
+            path = d / ("%s_%s.npy" % (method, suffix))
+            if not path.exists():
+                continue
+            vals = np.load(path)
+            x = _fraction_x(len(vals))
+            ax.plot(x, vals, marker="o", label=method, markersize=3)
+        ax.set_xlabel("Fraction of cascade randomized")
+        ax.set_ylabel(ylabel)
+        ax.set_title(cfg["title"])
+        ax.legend(fontsize=6, ncol=2)
+    plt.tight_layout()
+    plt.savefig(FIGURES_DIR / fname, dpi=150)
+    plt.show()
+
+plot_metric_curves_div("spearman_mean", "Spearman (diverging norm)", "spearman_curves_div.png")
+plot_metric_curves_div("ssim_mean", "SSIM (diverging norm)", "ssim_curves_div.png")
+"""
+        ),
+        cell_code(
+            """
 def plot_cross_vit_attention(metric_suffix, ylabel, fname):
     n_methods = len(VIT_ATTENTION_METHODS)
     fig, axes = plt.subplots(1, n_methods, figsize=(6 * n_methods, 4), sharey=True)
@@ -313,8 +359,9 @@ def plot_cross_vit_attention(metric_suffix, ylabel, fname):
             if not path.exists():
                 continue
             vals = np.load(path)
-            ax.plot(range(len(vals)), vals, marker="o", label=label, markersize=3)
-        ax.set_xlabel("Randomization depth")
+            x = _fraction_x(len(vals))
+            ax.plot(x, vals, marker="o", label=label, markersize=3)
+        ax.set_xlabel("Fraction of cascade randomized")
         ax.set_ylabel(ylabel)
         ax.set_title(method)
         ax.legend(fontsize=7)

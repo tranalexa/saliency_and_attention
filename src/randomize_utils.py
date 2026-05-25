@@ -52,27 +52,32 @@ def get_vit_block_names(model: nn.Module) -> List[str]:
     return order
 
 
-def get_resnet_conv1_names(model: nn.Module) -> List[str]:
-    """Return cascade order: classifier (fc) first, then Bottleneck conv1 top-to-bottom (Adebayo-style)."""
-    conv1_names = []
-    for name, module in model.named_modules():
-        if name.endswith(".conv1") and isinstance(module, nn.Conv2d):
-            if name.split(".")[0].startswith("layer"):
-                conv1_names.append(name)
+def _resnet_block_sort_key(block_name: str):
+    parts = block_name.split(".")
+    layer = parts[0]
+    block = int(parts[1]) if len(parts) > 1 else 0
     stage_order = {"layer4": 0, "layer3": 1, "layer2": 2, "layer1": 3}
+    return (stage_order.get(layer, 99), -block)
 
-    def sort_key(n: str):
-        parts = n.split(".")
-        layer = parts[0]
-        block = int(parts[1]) if len(parts) > 1 else 0
-        return (stage_order.get(layer, 99), -block)
 
-    conv1_names.sort(key=sort_key)
+def get_resnet_block_names(model: nn.Module) -> List[str]:
+    """Return cascade order: fc first, then full Bottleneck modules top-to-bottom (Adebayo-style)."""
+    blocks = set()
+    for name, _ in model.named_parameters():
+        m = re.match(r"^(layer\d+)\.(\d+)\.", name)
+        if m:
+            blocks.add("%s.%s" % (m.group(1), m.group(2)))
+    block_names = sorted(blocks, key=_resnet_block_sort_key)
     order: List[str] = []
     if any(n == "fc.weight" or n.startswith("fc.") for n, _ in model.named_parameters()):
         order.append("fc")
-    order.extend(conv1_names)
+    order.extend(block_names)
     return order
+
+
+def get_resnet_conv1_names(model: nn.Module) -> List[str]:
+    """Alias for get_resnet_block_names (full Bottleneck modules)."""
+    return get_resnet_block_names(model)
 
 
 def save_checkpoint(model: nn.Module) -> Dict[str, torch.Tensor]:
