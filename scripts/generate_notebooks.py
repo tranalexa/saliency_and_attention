@@ -383,6 +383,7 @@ for arch, cfg in ARCHS.items():
         depth_indices=depth_indices,
         out_path=FIGURES_DIR / ("cascade_grid_%s.png" % arch),
         title=cfg["title"] + " cascading randomization (image %d)" % img_idx,
+        arch=arch,
         show=True,
     )
     print("%s paper grid -> cascade_grid_%s.png (image_index=%d)" % (arch, arch, img_idx))
@@ -401,6 +402,7 @@ for arch, method, title in [
         method,
         out_path=FIGURES_DIR / ("cascade_%s_%s.png" % (arch, method)),
         title=title,
+        arch=arch,
         show=False,
     )
 
