@@ -33,22 +33,55 @@ def reset_layer(model: nn.Module, layer_name: str) -> None:
                 nn.init.normal_(param, mean=0.0, std=0.02)
 
 
+_VIT_BLOCK_MODULE_RE = re.compile(r"^(?:(.+)\.)?blocks\.(\d+)$")
+
+
+def _vit_classifier_layer(model: nn.Module) -> str | None:
+    """Submodule path for the ImageNet classifier head (timm or hub DINOv2)."""
+    for name, _ in model.named_parameters():
+        if name.endswith("linear_head.weight"):
+            return name[: -len(".weight")]
+        if name.endswith("head.weight"):
+            return name[: -len(".weight")]
+        if name.endswith("fc.weight"):
+            return name[: -len(".weight")]
+    return None
+
+
+def vit_blocks_prefix(model: nn.Module) -> str:
+    """Canonical blocks path prefix (``blocks`` for timm, ``backbone.blocks`` for hub DINOv2)."""
+    prefix_counts: dict[str, int] = {}
+    indices_by_prefix: dict[str, set[int]] = {}
+    for name, _ in model.named_modules():
+        m = _VIT_BLOCK_MODULE_RE.match(name)
+        if not m:
+            continue
+        parent = m.group(1)
+        prefix = f"{parent}.blocks" if parent else "blocks"
+        prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+        indices_by_prefix.setdefault(prefix, set()).add(int(m.group(2)))
+    if not prefix_counts:
+        raise ValueError("Could not find ViT blocks in model.")
+    return max(
+        prefix_counts,
+        key=lambda p: (len(indices_by_prefix[p]), prefix_counts[p], p.startswith("backbone")),
+    )
+
+
 def get_vit_block_names(model: nn.Module) -> List[str]:
     """Return cascade order: classifier first, then ViT blocks top-to-bottom (Adebayo-style)."""
-    block_indices = set()
-    for name, _ in model.named_modules():
-        m = re.match(r"blocks\.(\d+)$", name)
-        if m:
-            block_indices.add(int(m.group(1)))
-    if not block_indices:
-        raise ValueError("Could not find ViT blocks in model.")
-    max_idx = max(block_indices)
+    prefix = vit_blocks_prefix(model)
+    max_idx = max(
+        int(m.group(2))
+        for name, _ in model.named_modules()
+        if (m := _VIT_BLOCK_MODULE_RE.match(name))
+        and (f"{m.group(1)}.blocks" if m.group(1) else "blocks") == prefix
+    )
     order: List[str] = []
-    if any(n.startswith("head") for n, _ in model.named_parameters()):
-        order.append("head")
-    elif any(n.startswith("fc") for n, _ in model.named_parameters()):
-        order.append("fc")
-    order.extend(f"blocks.{i}" for i in range(max_idx, -1, -1))
+    head_layer = _vit_classifier_layer(model)
+    if head_layer:
+        order.append(head_layer)
+    order.extend(f"{prefix}.{i}" for i in range(max_idx, -1, -1))
     return order
 
 

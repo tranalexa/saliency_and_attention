@@ -98,6 +98,20 @@ def build_transform(image_size: int = 224):
     )
 
 
+def build_dinov2_transform(image_size: int = 224):
+    """Meta DINOv2 ImageNet eval: Resize(crop_size) + CenterCrop (see dinov2/data/transforms.py)."""
+    return transforms.Compose(
+        [
+            transforms.Resize(
+                image_size, interpolation=transforms.InterpolationMode.BICUBIC
+            ),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
+    )
+
+
 def load_imagenet_subset(
     root: str | Path,
     num_images: int = 500,
@@ -117,6 +131,62 @@ def load_imagenet_subset(
         dataset = ImageFolder(str(root), transform=transform)
     indices = list(range(min(num_images, len(dataset))))
     return Subset(dataset, indices), indices
+
+
+def load_dinov2_imagenet_subset(
+    root: str | Path,
+    num_images: int = 500,
+    image_size: int = 224,
+    transform=None,
+) -> Tuple[Subset, List[int]]:
+    """Val subset for DINOv2 LC: ImageFolder on val/ only (matches Meta README layout)."""
+    root = Path(root)
+    val_dir = root / "val"
+    if not val_dir.is_dir():
+        raise FileNotFoundError(
+            "DINOv2 needs %s with synset subfolders (see Meta README Data preparation)."
+            % val_dir
+        )
+    transform = transform or build_dinov2_transform(image_size)
+    dataset = ImageFolder(str(val_dir), transform=transform)
+    indices = list(range(min(num_images, len(dataset))))
+    return Subset(dataset, indices), indices
+
+
+class Dinov2ImageNetClassifier(nn.Module):
+    """Wrapper for torch.hub dinov2_vitb14_lc (blocks/patch_embed exposed for hooks).
+
+    The hub classifier is stored without registering it as a child module so
+    cascade paths stay ``linear_head``, ``blocks.N`` (not ``classifier.backbone.*``).
+    """
+
+    def __init__(self, classifier: nn.Module):
+        super().__init__()
+        backbone = classifier.backbone
+        self.patch_embed = backbone.patch_embed
+        self.blocks = backbone.blocks
+        self.norm = backbone.norm
+        self.linear_head = classifier.linear_head
+        object.__setattr__(self, "_hub_classifier", classifier)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._hub_classifier(x)
+
+    def to(self, *args, **kwargs):
+        """Move aliased submodules and hub-only params (e.g. cls_token) together."""
+        self._hub_classifier.to(*args, **kwargs)
+        return super().to(*args, **kwargs)
+
+
+def create_dinov2_imagenet_model(device: str = "cuda") -> nn.Module:
+    """Official ImageNet classifier from Meta README: dinov2_vitb14_lc."""
+    classifier = torch.hub.load(
+        "facebookresearch/dinov2",
+        "dinov2_vitb14_lc",
+        layers=1,
+        pretrained=True,
+    )
+    return Dinov2ImageNetClassifier(classifier).to(device).eval()
 
 
 def denormalize(tensor: torch.Tensor) -> torch.Tensor:
@@ -568,8 +638,15 @@ def _setup_arch_model(
     smoothgrad_samples: int,
 ) -> Tuple[nn.Module, List[str], Subset, Callable[[str, torch.Tensor, torch.Tensor], np.ndarray], List[str]]:
     """Load model, dataset subset, and saliency compute_fn for an architecture."""
-    transform = build_transform(image_size)
-    dataset, _ = load_imagenet_subset(imagenet_root, num_images, transform=transform)
+    if arch == "dinov2":
+        dataset, _ = load_dinov2_imagenet_subset(imagenet_root, num_images, image_size=image_size)
+    else:
+        dataset, _ = load_imagenet_subset(
+            imagenet_root,
+            num_images,
+            image_size=image_size,
+            transform=build_transform(image_size),
+        )
 
     if arch == "resnet50":
         model = timm.create_model("resnet50", pretrained=True).to(device).eval()
@@ -600,11 +677,8 @@ def _setup_arch_model(
             attention_grid_size=grid_size,
         )
     elif arch == "dinov2":
-        model_name = "vit_base_patch14_dinov2.lvd142m"
         grid_size = 16
-        model = timm.create_model(
-            model_name, pretrained=True, img_size=image_size, num_classes=1000
-        ).to(device).eval()
+        model = create_dinov2_imagenet_model(device=device)
         order = get_vit_block_names(model)
         gradcam_layer = model.patch_embed.proj
         methods = list(VIT_SALIENCY_METHODS)
@@ -705,11 +779,21 @@ def run_mechanistic(
     force_recompute: bool = False,
 ) -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
-    transform = build_transform(image_size)
-    dataset, _ = load_imagenet_subset(imagenet_root, num_images, transform=transform)
+    if "dinov2" in model_name:
+        dataset, _ = load_dinov2_imagenet_subset(imagenet_root, num_images, image_size=image_size)
+    else:
+        dataset, _ = load_imagenet_subset(
+            imagenet_root,
+            num_images,
+            image_size=image_size,
+            transform=build_transform(image_size),
+        )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-    create_kwargs = {"pretrained": True, **(model_kwargs or {})}
-    model = timm.create_model(model_name, **create_kwargs).to(device).eval()
+    if "dinov2" in model_name:
+        model = create_dinov2_imagenet_model(device=device)
+    else:
+        create_kwargs = {"pretrained": True, **(model_kwargs or {})}
+        model = timm.create_model(model_name, **create_kwargs).to(device).eval()
     order = order_fn(model)
     original_sd = save_checkpoint(model)
 
@@ -903,8 +987,17 @@ def run_arch_method_pipeline(
     validate_imagenet_root(imagenet_root)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    transform = build_transform(image_size)
-    dataset, image_indices = load_imagenet_subset(imagenet_root, num_images, transform=transform)
+    if arch == "dinov2":
+        dataset, image_indices = load_dinov2_imagenet_subset(
+            imagenet_root, num_images, image_size=image_size
+        )
+    else:
+        dataset, image_indices = load_imagenet_subset(
+            imagenet_root,
+            num_images,
+            image_size=image_size,
+            transform=build_transform(image_size),
+        )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
     if arch == "resnet50":
@@ -930,11 +1023,8 @@ def run_arch_method_pipeline(
             attention_grid_size=grid_size,
         )
     elif arch == "dinov2":
-        model_name = "vit_base_patch14_dinov2.lvd142m"
         grid_size = 16
-        model = timm.create_model(
-            model_name, pretrained=True, img_size=image_size, num_classes=1000
-        ).to(device).eval()
+        model = create_dinov2_imagenet_model(device=device)
         if num_images >= 50:
             validate_dinov2_classifier(model, loader, device)
         order = get_vit_block_names(model)
@@ -1069,16 +1159,27 @@ def run_vit_pipeline(
     methods = list(VIT_SALIENCY_METHODS) if use_attention else list(SHARED_SALIENCY_METHODS)
     arch_tag = "dinov2" if "dinov2" in model_name else "vit"
 
-    transform = build_transform(image_size)
-    dataset, image_indices = load_imagenet_subset(imagenet_root, num_images, transform=transform)
+    if "dinov2" in model_name:
+        dataset, image_indices = load_dinov2_imagenet_subset(
+            imagenet_root, num_images, image_size=image_size
+        )
+    else:
+        dataset, image_indices = load_imagenet_subset(
+            imagenet_root,
+            num_images,
+            image_size=image_size,
+            transform=build_transform(image_size),
+        )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    model_kwargs = {"pretrained": True, "img_size": image_size}
     if "dinov2" in model_name:
-        model_kwargs["num_classes"] = 1000
-    model = timm.create_model(model_name, **model_kwargs).to(device).eval()
-    if "dinov2" in model_name and num_images >= 50:
-        validate_dinov2_classifier(model, loader, device)
+        model = create_dinov2_imagenet_model(device=device)
+        if num_images >= 50:
+            validate_dinov2_classifier(model, loader, device)
+    else:
+        model = timm.create_model(
+            model_name, pretrained=True, img_size=image_size
+        ).to(device).eval()
     order = get_vit_block_names(model)
     gradcam_layer = model.patch_embed.proj
     fn_kw = dict(
@@ -1171,9 +1272,8 @@ def run_mechanistic_pipeline(
         force_recompute=force_recompute,
     )
     run_mechanistic(
-        "vit_base_patch14_dinov2.lvd142m", "dinov2", get_vit_block_names,
+        "dinov2_vitb14_lc", "dinov2", get_vit_block_names,
         reduce_activation_scales,
         imagenet_root, results_dir, num_images, image_size, batch_size, device,
-        model_kwargs={"img_size": image_size, "num_classes": 1000},
         force_recompute=force_recompute,
     )

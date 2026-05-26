@@ -28,10 +28,22 @@ app = modal.App(APP_NAME)
 imagenet_vol = modal.Volume.from_name(IMAGENET_VOLUME, create_if_missing=True)
 results_vol = modal.Volume.from_name(RESULTS_VOLUME, create_if_missing=True)
 
+def _preload_pretrained_weights() -> None:
+    """Cache hub/timm weights on Modal at image build (per Meta README)."""
+    import timm
+    import torch
+
+    timm.create_model("resnet50", pretrained=True)
+    timm.create_model("vit_base_patch16_224", pretrained=True, img_size=224)
+    torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14_lc", layers=1, pretrained=True)
+    print("Preloaded ResNet-50, ViT-B/16, dinov2_vitb14_lc.")
+
+
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install_from_requirements(str(REPO_ROOT / "requirements-pytorch.txt"))
     .env({"PYTHONPATH": "/root/src"})
+    .run_function(_preload_pretrained_weights)
     .add_local_dir(str(REPO_ROOT / "src"), remote_path="/root/src")
 )
 

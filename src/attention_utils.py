@@ -10,27 +10,38 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from metrics_utils import abs_grayscale_norm
+from randomize_utils import vit_blocks_prefix
 
 
 def _get_attn_modules(model: nn.Module) -> List[Tuple[str, nn.Module]]:
-    """Collect attention modules from timm ViT blocks in order."""
+    """Collect attention modules from timm or DINOv2 ViT blocks in order."""
+    prefix = vit_blocks_prefix(model)
+    pat = re.compile(rf"^{re.escape(prefix)}\.(\d+)\.attn$")
     modules = []
     for name, module in model.named_modules():
-        if re.match(r"blocks\.(\d+)\.attn$", name):
-            modules.append((int(name.split(".")[1]), name, module))
+        m = pat.match(name)
+        if m:
+            modules.append((int(m.group(1)), name, module))
     modules.sort(key=lambda x: x[0])
     return [(n, m) for _, n, m in modules]
 
 
+def _attn_head_dim(module: nn.Module) -> int:
+    if hasattr(module, "head_dim"):
+        return int(module.head_dim)
+    return module.qkv.in_features // module.num_heads
+
+
 def _compute_attention_probs(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """Compute (B, H, N, N) attention probabilities from timm Attention module."""
+    """Compute (B, H, N, N) attention probabilities from timm or DINOv2 Attention."""
     b, n, _ = x.shape
-    qkv = module.qkv(x).reshape(b, n, 3, module.num_heads, module.head_dim)
+    head_dim = _attn_head_dim(module)
+    qkv = module.qkv(x).reshape(b, n, 3, module.num_heads, head_dim)
     qkv = qkv.permute(2, 0, 3, 1, 4)
     q, k, _v = qkv.unbind(0)
     if hasattr(module, "q_norm"):
         q, k = module.q_norm(q), module.k_norm(k)
-    scale = getattr(module, "scale", module.head_dim**-0.5)
+    scale = module.scale if hasattr(module, "scale") else head_dim**-0.5
     q = q * scale
     attn = q @ k.transpose(-2, -1)
     attn = attn.softmax(dim=-1)

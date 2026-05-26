@@ -30,9 +30,14 @@ Shared Captum: gradient, smoothgrad, input_grad, ig, gradcam.
 
 IG–SmoothGrad is not run (too costly at 500 images × cascade depth).
 
-## DINOv2 classifier
+## DINOv2 classifier (ImageNet-pretrained)
 
-Before `num_images >= 50`, the pipeline probes 10 val images. If top-1 accuracy or mean confidence is near chance, it raises an error (untrained default head).
+Per [Meta DINOv2 README](https://github.com/facebookresearch/dinov2): use **`torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_lc', layers=1)`** (ViT-B/14 distilled, ~84.5% linear ImageNet), not timm `num_classes=1000` (random head).
+
+- **Val layout:** `/imagenet/val/n01440764/ILSVRC2012_val_....JPEG` (from `modal/download_imagenet.py` + devkit). Meta also uses `labels.txt` + `extra/*.npy` for their training `ImageNet` class; **not required** for hub LC inference.
+- **Preprocess:** `build_dinov2_transform` — Resize(224) + CenterCrop(224).
+
+Before `num_images >= 50`, a short probe checks top-1 accuracy on val.
 
 ## Out of scope
 
