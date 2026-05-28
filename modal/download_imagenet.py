@@ -25,7 +25,7 @@ imagenet_vol = modal.Volume.from_name(IMAGENET_VOLUME, create_if_missing=True)
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("wget", "ca-certificates", "tar")
-    .pip_install("tqdm", "scipy", "numpy")
+    .pip_install("tqdm", "scipy", "numpy", "torch")
 )
 
 
@@ -46,43 +46,70 @@ def _validate_download_url(url: str, label: str) -> None:
     )
 
 
+def _is_wnid_dirname(name: str) -> bool:
+    import re
+
+    return re.fullmatch(r"n\d{8}", name) is not None
+
+
+def parse_devkit_meta(devkit_data_dir):
+    """Parse ILSVRC2012 devkit into (wnid_to_classes, val_wnids).
+
+    Matches torchvision.datasets.ImageNet.parse_devkit_archive exactly: default
+    struct_as_record=True so each synset row is a numpy.void that unpacks as
+    (ILSVRC2012_ID, WNID, words, gloss, num_children, ...). struct_as_record=False
+    returns mat_struct objects that aren't iterable, which breaks zip(*synsets).
+    """
+    from scipy.io import loadmat
+
+    meta_file = devkit_data_dir / "meta.mat"
+    gt_file = devkit_data_dir / "ILSVRC2012_validation_ground_truth.txt"
+    if not meta_file.exists() or not gt_file.exists():
+        raise FileNotFoundError(
+            "Devkit must contain data/meta.mat and data/ILSVRC2012_validation_ground_truth.txt"
+        )
+
+    synsets = loadmat(str(meta_file), squeeze_me=True)["synsets"]
+    nums_children = list(zip(*synsets))[4]
+    leaves = [synsets[i] for i, n in enumerate(nums_children) if n == 0]
+    idcs, wnids, classes = list(zip(*leaves))[:3]
+    classes = [tuple(str(c).split(", ")) for c in classes]
+    idx_to_wnid = {int(idx): str(w) for idx, w in zip(idcs, wnids)}
+    wnid_to_classes = {str(w): c for w, c in zip(wnids, classes)}
+
+    val_idcs = [int(x) for x in gt_file.read_text().strip().splitlines()]
+    val_wnids = [idx_to_wnid[i] for i in val_idcs]
+    return wnid_to_classes, val_wnids
+
+
 def _organize_val_flat_dir(val_workdir, devkit_data_dir):
     """Sort flat val JPEGs into synset subfolders (equivalent to valprep.sh)."""
     import shutil
 
-    import numpy as np
-    from scipy.io import loadmat  # noqa: F401
-
-    gt_file = devkit_data_dir / "ILSVRC2012_validation_ground_truth.txt"
-    meta_file = devkit_data_dir / "meta.mat"
-    if not gt_file.exists() or not meta_file.exists():
-        raise FileNotFoundError(
-            "Devkit must contain data/ILSVRC2012_validation_ground_truth.txt and data/meta.mat"
-        )
-
-    meta = loadmat(str(meta_file), squeeze_me=True, struct_as_record=False)
-    synsets_raw = meta["synsets"]
-    synsets = []
-    for s in synsets_raw:
-        if isinstance(s, np.ndarray):
-            synsets.append(str(s[0]))
-        else:
-            synsets.append(str(s))
-    labels = [int(x) for x in gt_file.read_text().strip().splitlines()]
+    _, val_wnids = parse_devkit_meta(devkit_data_dir)
 
     jpgs = sorted(val_workdir.glob("*.JPEG"))
-    if len(jpgs) != len(labels):
+    if len(jpgs) != len(val_wnids):
         raise RuntimeError(
-            "Expected %d val images, found %d (check val tar extraction)." % (len(labels), len(jpgs))
+            "Expected %d val images, found %d (check val tar extraction)."
+            % (len(val_wnids), len(jpgs))
         )
 
-    for jpg, label in zip(jpgs, labels):
-        synset = synsets[label - 1]
-        dest_dir = val_workdir / synset
+    for jpg, wnid in zip(jpgs, val_wnids):
+        dest_dir = val_workdir / wnid
         dest_dir.mkdir(exist_ok=True)
         shutil.move(str(jpg), str(dest_dir / jpg.name))
 
-    return len(jpgs), len(set(synsets))
+    return len(jpgs), len(set(val_wnids))
+
+
+def _write_meta_bin(imagenet_root, devkit_data_dir) -> None:
+    import torch
+
+    meta = parse_devkit_meta(devkit_data_dir)
+    out = imagenet_root / "meta.bin"
+    torch.save(meta, out)
+    print("Wrote %s (%d classes)" % (out, len(meta[0])))
 
 
 @app.function(
@@ -113,11 +140,28 @@ def download_imagenet_val(
     devkit_dir = staging / "devkit"
 
     if skip_if_exists and val_dir.exists():
-        n_subdirs = sum(1 for p in val_dir.iterdir() if p.is_dir())
+        class_dirs = [p for p in val_dir.iterdir() if p.is_dir()]
+        n_subdirs = len(class_dirs)
         n_files = sum(1 for _ in val_dir.rglob("*.JPEG"))
         if n_subdirs > 0 and n_files > 1000:
-            print("Skipping download: %d class dirs, %d images under %s" % (n_subdirs, n_files, val_dir))
-            return {"status": "skipped", "val_dir": str(val_dir), "n_images": n_files}
+            bad_dirs = [p.name for p in class_dirs if not _is_wnid_dirname(p.name)]
+            if bad_dirs:
+                print(
+                    "Existing val dir has non-WNID class folders (first few: %s); "
+                    "re-downloading and rebuilding /val."
+                    % sorted(bad_dirs)[:5]
+                )
+            else:
+                meta_bin = imagenet_root / "meta.bin"
+                if meta_bin.exists():
+                    print("Skipping download: %d class dirs, %d images under %s" % (n_subdirs, n_files, val_dir))
+                    return {"status": "skipped", "val_dir": str(val_dir), "n_images": n_files}
+                return {
+                    "status": "need_meta_bin",
+                    "val_dir": str(val_dir),
+                    "n_images": n_files,
+                    "hint": "modal run modal/download_imagenet.py --backfill-meta-only --devkit-tar-url URL",
+                }
 
     _validate_download_url(val_tar_url, "val-tar-url")
     _validate_download_url(devkit_tar_url, "devkit-tar-url")
@@ -172,6 +216,9 @@ def download_imagenet_val(
     print("Organizing val into class folders...")
     n_images, _ = _organize_val_flat_dir(val_workdir, devkit_data)
 
+    print("Writing meta.bin for ILSVRC class indices (DINOv2 / torchvision)...")
+    _write_meta_bin(imagenet_root, devkit_data)
+
     shutil.move(str(val_workdir), str(val_dir))
     n_subdirs = sum(1 for p in val_dir.iterdir() if p.is_dir())
     print("Done: %d images, %d class folders at %s" % (n_images, n_subdirs, val_dir))
@@ -181,17 +228,65 @@ def download_imagenet_val(
     return {"status": "ok", "val_dir": str(val_dir), "n_images": n_images, "n_classes": n_subdirs}
 
 
+@app.function(
+    image=download_image,
+    timeout=3600,
+    volumes={IMAGENET_MOUNT: imagenet_vol},
+)
+def backfill_meta_bin(devkit_tar_url: str):
+    """Download devkit only and write /imagenet/meta.bin (for existing val/ layouts)."""
+    import shutil
+    import tarfile
+    from pathlib import Path
+    from urllib.request import urlretrieve
+
+    _validate_download_url(devkit_tar_url, "devkit-tar-url")
+    imagenet_root = Path(IMAGENET_MOUNT)
+    staging = imagenet_root / "_meta_staging"
+    devkit_tar_path = staging / "ILSVRC2012_devkit_t12.tar"
+    devkit_dir = staging / "devkit"
+
+    staging.mkdir(parents=True, exist_ok=True)
+    print("Downloading devkit...")
+    urlretrieve(devkit_tar_url.strip(), devkit_tar_path)
+
+    if devkit_dir.exists():
+        shutil.rmtree(devkit_dir)
+    devkit_dir.mkdir(parents=True)
+    with tarfile.open(devkit_tar_path, "r") as tf:
+        tf.extractall(path=devkit_dir)
+    data_dirs = list(devkit_dir.rglob("data"))
+    devkit_data = None
+    for d in data_dirs:
+        if (d / "meta.mat").exists() and (d / "ILSVRC2012_validation_ground_truth.txt").exists():
+            devkit_data = d
+            break
+    if devkit_data is None:
+        raise RuntimeError("Could not find devkit data/ with meta.mat")
+
+    _write_meta_bin(imagenet_root, devkit_data)
+    shutil.rmtree(staging, ignore_errors=True)
+    imagenet_vol.commit()
+    return {"status": "ok", "meta_bin": str(imagenet_root / "meta.bin")}
+
+
 @app.local_entrypoint()
 def main(
     val_tar_url: str = "",
     devkit_tar_url: str = "",
     skip_if_exists: bool = True,
+    backfill_meta_only: bool = False,
 ):
     """
     Download ImageNet val + devkit inside Modal into volume saliency-imagenet.
 
     Paste full https URLs from https://image-net.org/download.php (ILSVRC 2012), not filenames.
     """
+    if backfill_meta_only:
+        _validate_download_url(devkit_tar_url, "devkit-tar-url")
+        result = backfill_meta_bin.remote(devkit_tar_url=devkit_tar_url)
+        print(result)
+        return
     _validate_download_url(val_tar_url, "val-tar-url")
     _validate_download_url(devkit_tar_url, "devkit-tar-url")
     result = download_imagenet_val.remote(

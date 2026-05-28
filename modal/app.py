@@ -297,8 +297,19 @@ def run_saliency_method(
     method: str,
     num_images: int = 500,
     batch_size: int = 8,
+    force_recompute: bool = False,
+    target_mode: str = "dynamic",
+    seed: int = 42,
 ):
-    _run_single_method(arch, method, num_images, batch_size)
+    _run_single_method(
+        arch,
+        method,
+        num_images,
+        batch_size,
+        force_recompute=force_recompute,
+        target_mode=target_mode,
+        seed=seed,
+    )
 
 
 def _methods_for_arch(arch: str) -> list[str]:

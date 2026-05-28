@@ -52,7 +52,13 @@ modal run modal/download_imagenet.py \
 
 Wrong (will error): `--val-tar-url "ILSVRC2012_img_val.tar"` — that is only the filename, not a URL.
 
-This downloads and extracts on Modal, organizes val with the devkit labels, writes to the volume, and deletes staging tarballs. Takes ~30–60+ minutes depending on ImageNet CDN speed.
+This downloads and extracts on Modal, organizes val with the devkit labels, writes `meta.bin` (ILSVRC class indices for DINOv2 validation), writes to the volume, and deletes staging tarballs. Takes ~30–60+ minutes depending on ImageNet CDN speed.
+
+If val was uploaded before `meta.bin` existed:
+
+```bash
+modal run modal/download_imagenet.py --backfill-meta-only --devkit-tar-url "https://.../ILSVRC2012_devkit_t12.tar"
+```
 
 Verify:
 

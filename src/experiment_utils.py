@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 from torchvision.datasets import ImageFolder
 from tqdm.auto import tqdm
@@ -98,6 +98,80 @@ def build_transform(image_size: int = 224):
     )
 
 
+META_BIN = "meta.bin"
+
+
+def _parse_ilsvrc_wnid_to_index_from_meta_mat(meta_mat_path: Path) -> dict[str, int]:
+    """Leaf synset WNID -> class index (0..999), matching torchvision ImageNet meta.
+
+    Uses default struct_as_record=True so each synset row is a numpy.void that
+    unpacks as (ILSVRC2012_ID, WNID, words, gloss, num_children, ...).
+    struct_as_record=False would return mat_struct objects that aren't iterable,
+    breaking zip(*synsets).
+    """
+    from scipy.io import loadmat
+
+    synsets = loadmat(str(meta_mat_path), squeeze_me=True)["synsets"]
+    nums_children = list(zip(*synsets))[4]
+    leaves = [synsets[i] for i, n in enumerate(nums_children) if n == 0]
+    wnids = list(zip(*leaves))[1]
+    return {str(wnid): i for i, wnid in enumerate(wnids)}
+
+
+def ilsvrc_wnid_to_index(root: str | Path) -> dict[str, int]:
+    """Map val-folder WNID names to ILSVRC class indices used by DINOv2/torchvision heads."""
+    root = Path(root)
+    meta_path = root / META_BIN
+    if meta_path.exists():
+        wnid_to_classes, _ = torch.load(meta_path, weights_only=True)
+        return {wnid: i for i, wnid in enumerate(wnid_to_classes.keys())}
+
+    for meta_mat in (
+        root / "ILSVRC2012_devkit_t12" / "data" / "meta.mat",
+        *root.glob("**/data/meta.mat"),
+    ):
+        if meta_mat.is_file():
+            return _parse_ilsvrc_wnid_to_index_from_meta_mat(meta_mat)
+
+    raise FileNotFoundError(
+        "ILSVRC class mapping not found under %s. Need %s (re-run modal/download_imagenet.py) "
+        "or devkit data/meta.mat on the volume."
+        % (root, META_BIN)
+    )
+
+
+class ILSVRCValDataset(Dataset):
+    """ImageFolder val layout with ILSVRC class indices (not alphabetical WNID order)."""
+
+    def __init__(
+        self,
+        val_dir: str | Path,
+        transform=None,
+        wnid_to_idx: dict[str, int] | None = None,
+        root_for_meta: str | Path | None = None,
+    ):
+        val_dir = Path(val_dir)
+        root_for_meta = Path(root_for_meta or val_dir.parent)
+        self.wnid_to_idx = wnid_to_idx or ilsvrc_wnid_to_index(root_for_meta)
+        self.inner = ImageFolder(str(val_dir), transform=transform)
+        missing = set(self.inner.classes) - set(self.wnid_to_idx)
+        if missing:
+            raise ValueError(
+                "Unknown WNIDs in val (first few): %s" % sorted(missing)[:5]
+            )
+
+    def __len__(self) -> int:
+        return len(self.inner)
+
+    def __getitem__(self, index: int):
+        path, _ = self.inner.samples[index]
+        wnid = Path(path).parent.name
+        image = self.inner.loader(path)
+        if self.inner.transform is not None:
+            image = self.inner.transform(image)
+        return image, self.wnid_to_idx[wnid]
+
+
 def build_dinov2_transform(image_size: int = 224):
     """Meta DINOv2 ImageNet eval: Resize(crop_size) + CenterCrop (see dinov2/data/transforms.py)."""
     return transforms.Compose(
@@ -126,7 +200,7 @@ def load_imagenet_subset(
         try:
             dataset = datasets.ImageNet(root=str(root), split=split, transform=transform)
         except Exception:
-            dataset = ImageFolder(str(val_dir), transform=transform)
+            dataset = ILSVRCValDataset(val_dir, transform=transform, root_for_meta=root)
     else:
         dataset = ImageFolder(str(root), transform=transform)
     indices = list(range(min(num_images, len(dataset))))
@@ -139,18 +213,15 @@ def load_dinov2_imagenet_subset(
     image_size: int = 224,
     transform=None,
 ) -> Tuple[Subset, List[int]]:
-    """Val subset for DINOv2 LC: ImageFolder on val/ only (matches Meta README layout)."""
-    root = Path(root)
-    val_dir = root / "val"
-    if not val_dir.is_dir():
-        raise FileNotFoundError(
-            "DINOv2 needs %s with synset subfolders (see Meta README Data preparation)."
-            % val_dir
-        )
+    """Val subset for DINOv2 LC with ILSVRC class indices (same loader as ResNet/ViT)."""
     transform = transform or build_dinov2_transform(image_size)
-    dataset = ImageFolder(str(val_dir), transform=transform)
-    indices = list(range(min(num_images, len(dataset))))
-    return Subset(dataset, indices), indices
+    return load_imagenet_subset(
+        root,
+        num_images=num_images,
+        split="val",
+        image_size=image_size,
+        transform=transform,
+    )
 
 
 class Dinov2ImageNetClassifier(nn.Module):

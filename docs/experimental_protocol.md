@@ -34,7 +34,7 @@ IG–SmoothGrad is not run (too costly at 500 images × cascade depth).
 
 Per [Meta DINOv2 README](https://github.com/facebookresearch/dinov2): use **`torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_lc', layers=1)`** (ViT-B/14 distilled, ~84.5% linear ImageNet), not timm `num_classes=1000` (random head).
 
-- **Val layout:** `/imagenet/val/n01440764/ILSVRC2012_val_....JPEG` (from `modal/download_imagenet.py` + devkit). Meta also uses `labels.txt` + `extra/*.npy` for their training `ImageNet` class; **not required** for hub LC inference.
+- **Val layout:** `/imagenet/val/n01440764/ILSVRC2012_val_....JPEG` (from `modal/download_imagenet.py` + devkit). Labels use ILSVRC indices via `meta.bin` or `ILSVRCValDataset` (not alphabetical `ImageFolder` order). If `meta.bin` is missing on the volume, run `modal/download_imagenet.py --backfill-meta-only`.
 - **Preprocess:** `build_dinov2_transform` — Resize(224) + CenterCrop(224).
 
 Before `num_images >= 50`, a short probe checks top-1 accuracy on val.
@@ -57,10 +57,10 @@ Before `num_images >= 50`, a short probe checks top-1 accuracy on val.
 Delete stale artifacts so skip-if-exists does not reuse old numbers:
 
 ```bash
-modal volume rm saliency-results/resnet50 --recursive
-modal volume rm saliency-results/vit --recursive
-modal volume rm saliency-results/dinov2 --recursive
-modal volume rm saliency-results/mechanistic --recursive
+modal volume rm saliency-results /resnet50 --recursive
+modal volume rm saliency-results /vit --recursive
+modal volume rm saliency-results /dinov2 --recursive
+modal volume rm saliency-results /mechanistic --recursive
 
 # optional: local copy
 rm -rf results/resnet50 results/vit results/dinov2 results/mechanistic results/figures
