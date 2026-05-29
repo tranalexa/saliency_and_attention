@@ -55,15 +55,27 @@ def _make_capture_hook(storage: list):
     return hook
 
 
+_ROLLOUT_SIGNAL_THRESHOLD = 1e-6
+
+
 def _cls_to_spatial_map(
     cls_weights: np.ndarray, grid_size: int, out_size: int = 224
 ) -> np.ndarray:
-    """Map CLS-to-patch weights to a 2D heatmap normalized to [0, 1]."""
+    """Map CLS-to-patch weights to a 2D heatmap normalized to [0, 1].
+
+    When the model is fully randomized the CLS→patch weights collapse toward
+    zero. Dividing by a near-zero max (abs_grayscale_norm) would amplify
+    numerical noise into a spuriously structured map that can anti-correlate
+    with the semantic baseline. Instead, return a uniform map when the signal
+    is below threshold.
+    """
     n_patches = cls_weights.shape[0]
     expected = grid_size * grid_size
     if n_patches != expected:
         grid_size = int(np.sqrt(n_patches))
     heatmap = cls_weights.reshape(grid_size, grid_size)
+    if np.abs(heatmap).max() < _ROLLOUT_SIGNAL_THRESHOLD:
+        return np.full((out_size, out_size), 0.5)
     heatmap_t = torch.from_numpy(heatmap).float()[None, None, ...]
     upsampled = F.interpolate(
         heatmap_t, size=(out_size, out_size), mode="bilinear", align_corners=False

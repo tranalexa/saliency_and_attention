@@ -115,8 +115,18 @@ def short_layer_label(name: str, max_len: int = 9) -> str:
 
 
 def prepare_map_for_display(map_2d: np.ndarray) -> np.ndarray:
-    """Absolute grayscale normalize to [0, 1] for imshow."""
-    return abs_grayscale_norm(np.asarray(map_2d))
+    """Min-max stretch to [0, 1] for imshow.
+
+    Unlike abs_grayscale_norm (divides by max, origin at 0), this subtracts the
+    minimum first so the full dynamic range is always visible. This matters for
+    diffuse maps like raw attention from a pretrained ViT where all values cluster
+    near the maximum, making abs-max norm render everything white.
+    """
+    m = np.abs(np.asarray(map_2d, dtype=np.float64))
+    lo, hi = m.min(), m.max()
+    if hi > lo:
+        return (m - lo) / (hi - lo)
+    return np.zeros_like(m)
 
 
 def prepare_heatmap(

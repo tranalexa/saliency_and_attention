@@ -347,7 +347,9 @@ def compute_ig(
     for i in range(images.shape[0]):
         inp = images[i : i + 1]
         tgt = int(target_indices[i].item())
-        attr = ig.attribute(inp, baselines=torch.zeros_like(inp), target=tgt, n_steps=n_steps)
+        imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=inp.device).view(1, 3, 1, 1)
+        baseline = imagenet_mean.expand_as(inp)
+        attr = ig.attribute(inp, baselines=baseline, target=tgt, n_steps=n_steps)
         maps.append(attribution_to_map(attr, norm=map_norm))
     return np.stack(maps)
 
@@ -462,7 +464,7 @@ def compute_gradcam(
     cam = LayerGradCam(model, layer)
     maps = []
     for i in range(images.shape[0]):
-        inp = images[i : i + 1]
+        inp = images[i : i + 1].requires_grad_(True)
         tgt = int(target_indices[i].item())
         attr = cam.attribute(inp, target=tgt)
         maps.append(attribution_to_map(attr, grid_size=grid_size, norm=map_norm))
@@ -722,7 +724,7 @@ def _setup_arch_model(
     if arch == "resnet50":
         model = timm.create_model("resnet50", pretrained=True).to(device).eval()
         order = get_resnet_block_names(model)
-        gradcam_layer = model.layer4[-1].conv3
+        gradcam_layer = model.layer4[-1]
         methods = list(RESNET50_SALIENCY_METHODS)
         compute_fn = make_saliency_compute_fn(
             model,
@@ -1074,7 +1076,7 @@ def run_arch_method_pipeline(
     if arch == "resnet50":
         model = timm.create_model("resnet50", pretrained=True).to(device).eval()
         order = get_resnet_block_names(model)
-        gradcam_layer = model.layer4[-1].conv3
+        gradcam_layer = model.layer4[-1]
         fn_kw = dict(
             ig_steps=ig_steps,
             smoothgrad_stdev=smoothgrad_stdev,
@@ -1179,7 +1181,7 @@ def run_resnet50_pipeline(
 
     model = timm.create_model("resnet50", pretrained=True).to(device).eval()
     order = get_resnet_block_names(model)
-    gradcam_layer = model.layer4[-1].conv3
+    gradcam_layer = model.layer4[-1]
     fn_kw = dict(
         ig_steps=ig_steps,
         smoothgrad_stdev=smoothgrad_stdev,
