@@ -16,16 +16,22 @@ from torchvision.datasets import ImageFolder
 from tqdm.auto import tqdm
 import timm
 
-from attention_utils import get_raw_attention, get_rollout
+from attention_utils import get_dino_reference_attn, get_raw_attention, get_rollout
 from metrics_utils import (
     abs_grayscale_norm,
+    characterize_cascade_curve,
+    characterize_sensitivity_thresholds,
+    compute_curve_auc,
     compute_logit_correlation,
+    compute_sensitivity_ratio,
     compute_spearman,
     compute_ssim,
     diverging_norm,
+    prepare_map_for_metric,
 )
 from viz_utils import pick_qual_image_index
 from randomize_utils import (
+    get_randomized_block_indices,
     get_resnet_block_names,
     get_vit_block_names,
     reset_layer,
@@ -34,30 +40,64 @@ from randomize_utils import (
 )
 
 TargetMode = Literal["dynamic", "frozen_baseline"]
-MapNorm = Literal["abs", "diverging"]
+MapNorm = Literal["raw", "abs", "diverging"]
+IgBaseline = Literal["zero", "mean"]
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-# Cross-architecture method sets (Adebayo-style cascading sanity checks).
-SHARED_SALIENCY_METHODS = [
-    "gradient",
-    "smoothgrad",
-    "input_grad",
-    "ig",
-    "gradcam",
-]
+# Class A — portable gradient methods (valid cross-architecture comparison).
+METHODS_CLASS_A = ["gradient", "smoothgrad", "input_grad", "ig"]
 
-# GBP / GBP-GC use Guided Backprop (ReLU-specific); ResNet only.
-RESNET50_SALIENCY_METHODS = SHARED_SALIENCY_METHODS + ["gbp", "gbp_gc"]
+METHODS_CLASS_B = {
+    "resnet50": ["gradcam"],
+    "vit": ["transformer_gradcam"],
+    "dinov2": ["transformer_gradcam"],
+}
 
-# ViT / DINOv2: shared Captum methods + attention (not in original Adebayo paper).
-VIT_SALIENCY_METHODS = SHARED_SALIENCY_METHODS + ["raw_attn", "rollout"]
+METHODS_CLASS_C = {
+    "resnet50": ["gbp", "gbp_gc"],
+    "vit": ["raw_attn", "rollout"],
+    "dinov2": ["raw_attn", "rollout"],
+}
 
-ARCH_SALIENCY_METHODS = {
-    "resnet50": RESNET50_SALIENCY_METHODS,
-    "vit": VIT_SALIENCY_METHODS,
-    "dinov2": VIT_SALIENCY_METHODS,
+METHODS_REFERENCE = {
+    "resnet50": [],
+    "vit": [],
+    "dinov2": ["dino_attn"],
+}
+
+METHODS_BY_ARCH = {
+    arch: METHODS_CLASS_A + METHODS_CLASS_B[arch] + METHODS_CLASS_C[arch] + METHODS_REFERENCE[arch]
+    for arch in ("resnet50", "vit", "dinov2")
+}
+
+# Backward-compatible aliases.
+SHARED_SALIENCY_METHODS = list(METHODS_CLASS_A)
+RESNET50_SALIENCY_METHODS = METHODS_BY_ARCH["resnet50"]
+VIT_SALIENCY_METHODS = METHODS_BY_ARCH["vit"]
+ARCH_SALIENCY_METHODS = METHODS_BY_ARCH
+
+METHODS_SCORED = {
+    arch: METHODS_CLASS_A + METHODS_CLASS_B[arch] + METHODS_CLASS_C[arch]
+    for arch in METHODS_BY_ARCH
+}
+
+PRIMARY_SPEARMAN_VARIANT = {
+    "ig": "signed_rms",
+    "input_grad": "signed_rms",
+}
+
+GRADCAM_TARGET_BY_ARCH = {
+    "resnet50": "layer4[-1]",
+    "vit": "blocks[-1].norm2",
+    "dinov2": "blocks[-1].norm2",
+}
+
+MECHANISTIC_ARCH_TAG = {
+    "resnet50": "resnet",
+    "vit": "vit",
+    "dinov2": "dinov2",
 }
 
 METHOD_BATCH_CAPS = {
@@ -66,7 +106,23 @@ METHOD_BATCH_CAPS = {
     "gbp_gc": 2,
     "gbp": 4,
     "gradcam": 4,
+    "transformer_gradcam": 4,
 }
+
+
+class CascadeContext:
+    """Mutable cascade depth state consumed by attention rollout."""
+
+    def __init__(
+        self,
+        arch: str = "",
+        order: List[str] | None = None,
+        grid_size: int | None = None,
+    ):
+        self.arch = arch
+        self.order = list(order or [])
+        self.depth = 0
+        self.grid_size = grid_size
 
 IMAGENET_UPLOAD_HINT = (
     "ImageNet not found. Options:\n"
@@ -173,12 +229,10 @@ class ILSVRCValDataset(Dataset):
 
 
 def build_dinov2_transform(image_size: int = 224):
-    """Meta DINOv2 ImageNet eval: Resize(crop_size) + CenterCrop (see dinov2/data/transforms.py)."""
+    """DINOv2 eval transform aligned with ViT: Resize(256) + CenterCrop(224)."""
     return transforms.Compose(
         [
-            transforms.Resize(
-                image_size, interpolation=transforms.InterpolationMode.BICUBIC
-            ),
+            transforms.Resize(256),
             transforms.CenterCrop(image_size),
             transforms.ToTensor(),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
@@ -309,6 +363,8 @@ def attribution_to_map(
             t = torch.from_numpy(arr).float()[None, None]
             up = F.interpolate(t, size=(out_size, out_size), mode="bilinear", align_corners=False)
             out = up.squeeze().numpy()
+            if norm == "raw":
+                return out.astype(np.float64)
             return abs_grayscale_norm(out) if norm == "abs" else diverging_norm(out)
     arr = attr.squeeze().detach().cpu().numpy()
     if arr.ndim == 1:
@@ -328,6 +384,8 @@ def attribution_to_map(
     t = torch.from_numpy(arr.astype(np.float64)).float()[None, None]
     up = F.interpolate(t, size=(out_size, out_size), mode="bilinear", align_corners=False)
     out = up.squeeze().numpy()
+    if norm == "raw":
+        return out.astype(np.float64)
     if norm == "abs":
         return abs_grayscale_norm(np.abs(out))
     return diverging_norm(out)
@@ -338,7 +396,8 @@ def compute_ig(
     images: torch.Tensor,
     target_indices: torch.Tensor,
     n_steps: int = 50,
-    map_norm: MapNorm = "abs",
+    map_norm: MapNorm = "raw",
+    ig_baseline: IgBaseline = "zero",
 ) -> np.ndarray:
     from captum.attr import IntegratedGradients
 
@@ -347,8 +406,13 @@ def compute_ig(
     for i in range(images.shape[0]):
         inp = images[i : i + 1]
         tgt = int(target_indices[i].item())
-        imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=inp.device).view(1, 3, 1, 1)
-        baseline = imagenet_mean.expand_as(inp)
+        if ig_baseline == "zero":
+            baseline = torch.zeros_like(inp)
+        else:
+            imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=inp.device).view(
+                1, 3, 1, 1
+            )
+            baseline = imagenet_mean.expand_as(inp)
         attr = ig.attribute(inp, baselines=baseline, target=tgt, n_steps=n_steps)
         maps.append(attribution_to_map(attr, norm=map_norm))
     return np.stack(maps)
@@ -358,7 +422,7 @@ def compute_gradient(
     model: nn.Module,
     images: torch.Tensor,
     target_indices: torch.Tensor,
-    map_norm: MapNorm = "abs",
+    map_norm: MapNorm = "raw",
 ) -> np.ndarray:
     from captum.attr import Saliency
 
@@ -378,7 +442,7 @@ def compute_smoothgrad(
     target_indices: torch.Tensor,
     stdev: float = 0.15,
     n_samples: int = 25,
-    map_norm: MapNorm = "abs",
+    map_norm: MapNorm = "raw",
 ) -> np.ndarray:
     from captum.attr import NoiseTunnel, Saliency
 
@@ -405,7 +469,7 @@ def compute_input_grad(
     model: nn.Module,
     images: torch.Tensor,
     target_indices: torch.Tensor,
-    map_norm: MapNorm = "abs",
+    map_norm: MapNorm = "raw",
 ) -> np.ndarray:
     from captum.attr import InputXGradient
 
@@ -424,7 +488,7 @@ def compute_gbp_gc(
     images: torch.Tensor,
     target_indices: torch.Tensor,
     layer: nn.Module,
-    map_norm: MapNorm = "abs",
+    map_norm: MapNorm = "raw",
 ) -> np.ndarray:
     gbp_maps = compute_gbp(model, images, target_indices, map_norm=map_norm)
     gc_maps = compute_gradcam(
@@ -437,7 +501,7 @@ def compute_gbp(
     model: nn.Module,
     images: torch.Tensor,
     target_indices: torch.Tensor,
-    map_norm: MapNorm = "abs",
+    map_norm: MapNorm = "raw",
 ) -> np.ndarray:
     from captum.attr import GuidedBackprop
 
@@ -457,7 +521,7 @@ def compute_gradcam(
     target_indices: torch.Tensor,
     layer: nn.Module,
     grid_size: int | None = None,
-    map_norm: MapNorm = "abs",
+    map_norm: MapNorm = "raw",
 ) -> np.ndarray:
     from captum.attr import LayerGradCam
 
@@ -467,7 +531,41 @@ def compute_gradcam(
         inp = images[i : i + 1].requires_grad_(True)
         tgt = int(target_indices[i].item())
         attr = cam.attribute(inp, target=tgt)
+        attr = F.relu(attr)
         maps.append(attribution_to_map(attr, grid_size=grid_size, norm=map_norm))
+    return np.stack(maps)
+
+
+def compute_transformer_gradcam(
+    model: nn.Module,
+    images: torch.Tensor,
+    layer: nn.Module,
+    grid_size: int,
+    out_size: int = 224,
+) -> np.ndarray:
+    """Architecture-native spatial attribution for ViT/DINOv2 (blocks[-1].norm2)."""
+    maps = []
+    for i in range(images.shape[0]):
+        inp = images[i : i + 1]
+        captured: list[torch.Tensor] = []
+
+        def hook(_module, _inp, output):
+            captured.append(output.detach())
+
+        handle = layer.register_forward_hook(hook)
+        model.eval()
+        with torch.no_grad():
+            model(inp)
+        handle.remove()
+
+        tokens = captured[0][0, 1:, :]
+        patch_scores = F.relu(tokens.mean(dim=-1))
+        heatmap = patch_scores.reshape(grid_size, grid_size).cpu().numpy()
+        heatmap_t = torch.from_numpy(heatmap).float()[None, None]
+        up = F.interpolate(
+            heatmap_t, size=(out_size, out_size), mode="bilinear", align_corners=False
+        )
+        maps.append(up.squeeze().numpy().astype(np.float64))
     return np.stack(maps)
 
 
@@ -498,19 +596,24 @@ def _method_baseline_exists(results_dir: Path, method: str) -> bool:
             return ("baseline_" + method) in np.load(legacy).files
         return False
     data = np.load(path)
-    return "baseline_map" in data.files and "baseline_map_div" in data.files
+    return "baseline_map_raw" in data.files or "baseline_map" in data.files
 
 
 def load_baseline_maps(
-    results_dir: Path, method: str, norm: MapNorm = "abs"
+    results_dir: Path, method: str, norm: MapNorm = "raw"
 ) -> np.ndarray:
-    key = "baseline_map" if norm == "abs" else "baseline_map_div"
+    if norm == "raw":
+        key = "baseline_map_raw"
+    elif norm == "abs":
+        key = "baseline_map"
+    else:
+        key = "baseline_map_div"
     per_method = _method_baseline_path(results_dir, method)
     if per_method.exists():
         data = np.load(per_method)
         if key in data.files:
             return data[key]
-        if norm == "abs" and "baseline_map" in data.files:
+        if norm == "raw" and "baseline_map" in data.files:
             return data["baseline_map"]
     legacy = results_dir / "baseline_maps.npz"
     if legacy.exists():
@@ -524,13 +627,84 @@ def load_baseline_maps(
     )
 
 
+def _primary_metric_file(method: str) -> str:
+    variant = PRIMARY_SPEARMAN_VARIANT.get(method, "abs_rms")
+    if variant == "signed_rms":
+        return "%s_spearman_rms.npy" % method
+    return "%s_spearman_abs_rms.npy" % method
+
+
+def _load_logit_corr(results_dir: Path, arch: str) -> np.ndarray | None:
+    tag = MECHANISTIC_ARCH_TAG.get(arch, arch)
+    path = results_dir.parent / "mechanistic" / ("logit_corr_%s.npy" % tag)
+    if path.exists():
+        return np.load(path)
+    return None
+
+
+def _fractional_depths(num_depths: int) -> np.ndarray:
+    if num_depths <= 1:
+        return np.array([0.0], dtype=np.float64)
+    return np.linspace(0.0, 1.0, num_depths, dtype=np.float64)
+
+
+def _save_curve_characterization(
+    results_dir: Path,
+    method: str,
+    arch: str,
+    similarity_mean: np.ndarray,
+    num_depths: int,
+    logit_corr: np.ndarray | None,
+) -> None:
+    depths = _fractional_depths(num_depths)
+    sim = np.asarray(similarity_mean, dtype=np.float64)
+    if arch == "dinov2" and sim.size > 1:
+        sim_for_ratio = sim[1:]
+        depths_for_ratio = depths[1:]
+    else:
+        sim_for_ratio = sim
+        depths_for_ratio = depths
+
+    primary_variant = PRIMARY_SPEARMAN_VARIANT.get(method, "abs_rms")
+    stats = characterize_cascade_curve(sim_for_ratio, depths_for_ratio)
+    stats["normalized_auc"] = compute_curve_auc(sim_for_ratio, depths_for_ratio)
+    if logit_corr is not None:
+        logit = np.asarray(logit_corr, dtype=np.float64)
+        if arch == "dinov2" and logit.size > 1:
+            logit = logit[1:]
+            logit_depths = depths[1:]
+        else:
+            logit_depths = depths
+        d_arch = characterize_cascade_curve(logit, logit_depths)["d_half"]
+        stats["d_arch"] = float(d_arch)
+        stats["sensitivity_ratio"] = compute_sensitivity_ratio(
+            stats["d_half"], logit, logit_depths
+        )
+        stats["threshold_sweep"] = characterize_sensitivity_thresholds(
+            sim_for_ratio, logit, logit_depths
+        )
+    with open(results_dir / ("%s_curve_stats.json" % method), "w") as f:
+        json.dump(stats, f, indent=2)
+    if logit_corr is not None:
+        ratio_payload = {
+            "method": method,
+            "arch": arch,
+            "primary_metric_variant": primary_variant,
+            "sensitivity_ratio": stats.get("sensitivity_ratio"),
+            "d_half": stats.get("d_half"),
+            "d_arch": stats.get("d_arch"),
+            "threshold_sweep": stats.get("threshold_sweep"),
+        }
+        with open(results_dir / ("%s_sensitivity_ratio.json" % method), "w") as f:
+            json.dump(ratio_payload, f, indent=2)
+
+
 def compute_baseline_maps(
     model: nn.Module,
     all_images: torch.Tensor,
     all_targets: torch.Tensor,
     methods: Sequence[str],
     compute_fn: Callable[[str, torch.Tensor, torch.Tensor], np.ndarray],
-    compute_fn_div: Callable[[str, torch.Tensor, torch.Tensor], np.ndarray],
     results_dir: Path,
     batch_size: int,
     device: str,
@@ -543,18 +717,18 @@ def compute_baseline_maps(
     if not missing:
         return
     for method in tqdm(missing, desc="baseline"):
-        batch_maps, batch_maps_div = [], []
+        if method == "dino_attn":
+            continue
+        batch_maps = []
         method_bs = _method_batch_size(method, batch_size)
         for start in range(0, len(all_images), method_bs):
             batch = all_images[start : start + method_bs].to(device)
             tgt = all_targets[start : start + method_bs].to(device)
             batch_maps.append(compute_fn(method, batch, tgt))
-            batch_maps_div.append(compute_fn_div(method, batch, tgt))
             _clear_cuda()
         np.savez_compressed(
             _method_baseline_path(results_dir, method),
-            baseline_map=np.concatenate(batch_maps, axis=0),
-            baseline_map_div=np.concatenate(batch_maps_div, axis=0),
+            baseline_map_raw=np.concatenate(batch_maps, axis=0),
         )
 
 
@@ -578,60 +752,100 @@ def run_cascading_experiment(
     all_targets: torch.Tensor,
     methods: Sequence[str],
     compute_fn: Callable[[str, torch.Tensor, torch.Tensor], np.ndarray],
-    compute_fn_div: Callable[[str, torch.Tensor, torch.Tensor], np.ndarray],
     results_dir: Path,
     batch_size: int,
     device: str,
+    arch: str,
+    cascade_context: CascadeContext,
     target_mode: TargetMode = "dynamic",
     force_recompute: bool = False,
 ) -> None:
     original_sd = save_checkpoint(model)
     num_depths = len(order)
     n_images = all_images.shape[0]
+    logit_corr = _load_logit_corr(results_dir, arch)
+
+    metric_variants = {
+        "spearman_rms": "signed_rms",
+        "spearman_abs_rms": "abs_rms",
+        "spearman_maxabs": "abs_maxabs",
+        "ssim_rms": "signed_rms",
+        "ssim_abs_rms": "abs_rms",
+        "ssim_maxabs": "abs_maxabs",
+    }
 
     for method in methods:
-        spearman_path = results_dir / ("%s_spearman.npy" % method)
-        if spearman_path.exists() and not force_recompute:
+        if method == "dino_attn":
+            continue
+        skip_path = results_dir / _primary_metric_file(method)
+        if skip_path.exists() and not force_recompute:
             print("Skip", method)
             continue
-        baseline_maps = load_baseline_maps(results_dir, method, norm="abs")
-        baseline_maps_div = load_baseline_maps(results_dir, method, norm="diverging")
-        spearman_all = np.full((num_depths, n_images), np.nan)
-        ssim_all = np.full((num_depths, n_images), np.nan)
-        spearman_div = np.full((num_depths, n_images), np.nan)
-        ssim_div = np.full((num_depths, n_images), np.nan)
+        baseline_raw = load_baseline_maps(results_dir, method, norm="raw")
+        arrays = {
+            key: np.full((num_depths, n_images), np.nan) for key in metric_variants
+        }
         for depth, _layer_name in enumerate(tqdm(order, desc=method)):
+            cascade_context.depth = depth
             restore_checkpoint(model, original_sd)
             for name in order[: depth + 1]:
                 reset_layer(model, name)
-            rand_maps, rand_maps_div = [], []
+            rand_maps = []
             method_bs = _method_batch_size(method, batch_size)
             for start in range(0, n_images, method_bs):
                 batch = all_images[start : start + method_bs].to(device)
                 tgt = _batch_targets(model, batch, all_targets, start, target_mode, device)
                 rand_maps.append(compute_fn(method, batch, tgt))
-                rand_maps_div.append(compute_fn_div(method, batch, tgt))
                 _clear_cuda()
             rand_maps = np.concatenate(rand_maps, axis=0)
-            rand_maps_div = np.concatenate(rand_maps_div, axis=0)
-            for i in range(n_images):
-                spearman_all[depth, i] = compute_spearman(baseline_maps[i], rand_maps[i])
-                ssim_all[depth, i] = compute_ssim(baseline_maps[i], rand_maps[i])
-                spearman_div[depth, i] = compute_spearman(
-                    baseline_maps_div[i], rand_maps_div[i]
+
+            if method == "raw_attn":
+                entropy_vals = []
+                for start in range(0, n_images, method_bs):
+                    batch = all_images[start : start + method_bs].to(device)
+                    for i in range(batch.shape[0]):
+                        _map, entropy = get_raw_attention(
+                            model,
+                            batch[i : i + 1],
+                            cascade_context.grid_size,
+                            return_entropy=True,
+                        )
+                        entropy_vals.append(entropy)
+                np.save(
+                    results_dir / ("raw_attn_entropy_depth%02d.npy" % depth),
+                    np.array(entropy_vals, dtype=np.float64),
                 )
-                ssim_div[depth, i] = compute_ssim(baseline_maps_div[i], rand_maps_div[i])
-        np.save(spearman_path, spearman_all)
-        np.save(results_dir / ("%s_ssim.npy" % method), ssim_all)
-        np.save(results_dir / ("%s_spearman_mean.npy" % method), np.nanmean(spearman_all, axis=1))
-        np.save(results_dir / ("%s_ssim_mean.npy" % method), np.nanmean(ssim_all, axis=1))
-        np.save(results_dir / ("%s_spearman_div.npy" % method), spearman_div)
-        np.save(results_dir / ("%s_ssim_div.npy" % method), ssim_div)
-        np.save(
-            results_dir / ("%s_spearman_div_mean.npy" % method),
-            np.nanmean(spearman_div, axis=1),
+
+            for i in range(n_images):
+                for metric_key, variant in metric_variants.items():
+                    base = prepare_map_for_metric(baseline_raw[i], variant)
+                    rand = prepare_map_for_metric(rand_maps[i], variant)
+                    if metric_key.startswith("spearman"):
+                        arrays[metric_key][depth, i] = compute_spearman(base, rand)
+                    else:
+                        arrays[metric_key][depth, i] = compute_ssim(base, rand)
+
+        for metric_key, arr in arrays.items():
+            np.save(results_dir / ("%s_%s.npy" % (method, metric_key)), arr)
+            np.save(
+                results_dir / ("%s_%s_mean.npy" % (method, metric_key)),
+                np.nanmean(arr, axis=1),
+            )
+
+        primary_key = (
+            "spearman_rms"
+            if PRIMARY_SPEARMAN_VARIANT.get(method) == "signed_rms"
+            else "spearman_abs_rms"
         )
-        np.save(results_dir / ("%s_ssim_div_mean.npy" % method), np.nanmean(ssim_div, axis=1))
+        if method in METHODS_CLASS_A or method in METHODS_CLASS_B.get(arch, []):
+            _save_curve_characterization(
+                results_dir,
+                method,
+                arch,
+                np.nanmean(arrays[primary_key], axis=1),
+                num_depths,
+                logit_corr,
+            )
 
 
 def _qual_has_all_methods(qual_path: Path, methods: Sequence[str]) -> bool:
@@ -649,6 +863,7 @@ def build_qual_bundle(
     compute_fn: Callable[[str, torch.Tensor, torch.Tensor], np.ndarray],
     results_dir: Path,
     device: str,
+    cascade_context: CascadeContext,
     image_index: int = 0,
     force: bool = False,
     target_mode: TargetMode = "dynamic",
@@ -685,9 +900,17 @@ def build_qual_bundle(
         }
     )
     for method in methods_to_compute:
-        out["baseline_" + method] = compute_fn(method, inp, baseline_tgt)[0]
+        if method == "dino_attn":
+            ref = get_dino_reference_attn(
+                model, inp, grid_size=cascade_context.grid_size, out_size=224
+            )
+            out["dino_reference_attn"] = ref
+            continue
+        raw = compute_fn(method, inp, baseline_tgt)[0]
+        out["baseline_" + method] = prepare_map_for_metric(raw, "abs_rms")
         cascade = []
         for depth in range(len(order)):
+            cascade_context.depth = depth
             restore_checkpoint(model, original_sd)
             for name in order[: depth + 1]:
                 reset_layer(model, name)
@@ -695,9 +918,79 @@ def build_qual_bundle(
                 tgt = get_target_indices(model, inp)
             else:
                 tgt = baseline_tgt
-            cascade.append(compute_fn(method, inp, tgt)[0])
+            cascade.append(prepare_map_for_metric(compute_fn(method, inp, tgt)[0], "abs_rms"))
         out["cascade_" + method] = np.stack(cascade)
     np.savez_compressed(qual_path, **out)
+
+
+def _build_arch_runtime(
+    arch: str,
+    device: str,
+    ig_steps: int = 50,
+    smoothgrad_stdev: float = 0.15,
+    smoothgrad_samples: int = 25,
+    image_size: int = 224,
+    ig_baseline: IgBaseline = "zero",
+) -> Tuple[nn.Module, List[str], CascadeContext, Callable, List[str], int | None]:
+    """Load model and saliency dispatch for an architecture."""
+    if arch == "resnet50":
+        model = timm.create_model("resnet50", pretrained=True).to(device).eval()
+        order = get_resnet_block_names(model)
+        grid_size = None
+        cascade_context = CascadeContext(arch=arch, order=order, grid_size=grid_size)
+        compute_fn = make_saliency_compute_fn(
+            model,
+            arch,
+            cascade_context,
+            gradcam_layer=model.layer4[-1],
+            ig_steps=ig_steps,
+            smoothgrad_stdev=smoothgrad_stdev,
+            smoothgrad_samples=smoothgrad_samples,
+            ig_baseline=ig_baseline,
+        )
+        return model, order, cascade_context, compute_fn, list(METHODS_BY_ARCH[arch]), grid_size
+
+    if arch == "vit":
+        model = timm.create_model(
+            "vit_base_patch16_224", pretrained=True, img_size=image_size
+        ).to(device).eval()
+        order = get_vit_block_names(model)
+        grid_size = 14
+        cascade_context = CascadeContext(arch=arch, order=order, grid_size=grid_size)
+        compute_fn = make_saliency_compute_fn(
+            model,
+            arch,
+            cascade_context,
+            transformer_gradcam_layer=model.blocks[-1].norm2,
+            grid_size=grid_size,
+            ig_steps=ig_steps,
+            smoothgrad_stdev=smoothgrad_stdev,
+            smoothgrad_samples=smoothgrad_samples,
+            attention_grid_size=grid_size,
+            ig_baseline=ig_baseline,
+        )
+        return model, order, cascade_context, compute_fn, list(METHODS_BY_ARCH[arch]), grid_size
+
+    if arch == "dinov2":
+        model = create_dinov2_imagenet_model(device=device)
+        order = get_vit_block_names(model)
+        grid_size = 16
+        cascade_context = CascadeContext(arch=arch, order=order, grid_size=grid_size)
+        compute_fn = make_saliency_compute_fn(
+            model,
+            arch,
+            cascade_context,
+            transformer_gradcam_layer=model.blocks[-1].norm2,
+            grid_size=grid_size,
+            ig_steps=ig_steps,
+            smoothgrad_stdev=smoothgrad_stdev,
+            smoothgrad_samples=smoothgrad_samples,
+            attention_grid_size=grid_size,
+            ig_baseline=ig_baseline,
+        )
+        return model, order, cascade_context, compute_fn, list(METHODS_BY_ARCH[arch]), grid_size
+
+    raise ValueError("Unknown arch: %s (use resnet50|vit|dinov2)" % arch)
 
 
 def _setup_arch_model(
@@ -709,7 +1002,8 @@ def _setup_arch_model(
     ig_steps: int,
     smoothgrad_stdev: float,
     smoothgrad_samples: int,
-) -> Tuple[nn.Module, List[str], Subset, Callable[[str, torch.Tensor, torch.Tensor], np.ndarray], List[str]]:
+    ig_baseline: IgBaseline = "zero",
+) -> Tuple[nn.Module, List[str], Subset, Callable[[str, torch.Tensor, torch.Tensor], np.ndarray], List[str], CascadeContext]:
     """Load model, dataset subset, and saliency compute_fn for an architecture."""
     if arch == "dinov2":
         dataset, _ = load_dinov2_imagenet_subset(imagenet_root, num_images, image_size=image_size)
@@ -721,52 +1015,16 @@ def _setup_arch_model(
             transform=build_transform(image_size),
         )
 
-    if arch == "resnet50":
-        model = timm.create_model("resnet50", pretrained=True).to(device).eval()
-        order = get_resnet_block_names(model)
-        gradcam_layer = model.layer4[-1]
-        methods = list(RESNET50_SALIENCY_METHODS)
-        compute_fn = make_saliency_compute_fn(
-            model,
-            gradcam_layer,
-            ig_steps=ig_steps,
-            smoothgrad_stdev=smoothgrad_stdev,
-            smoothgrad_samples=smoothgrad_samples,
-        )
-    elif arch == "vit":
-        model_name = "vit_base_patch16_224"
-        grid_size = 14
-        model = timm.create_model(model_name, pretrained=True, img_size=image_size).to(device).eval()
-        order = get_vit_block_names(model)
-        gradcam_layer = model.patch_embed.proj
-        methods = list(VIT_SALIENCY_METHODS)
-        compute_fn = make_saliency_compute_fn(
-            model,
-            gradcam_layer,
-            grid_size=grid_size,
-            ig_steps=ig_steps,
-            smoothgrad_stdev=smoothgrad_stdev,
-            smoothgrad_samples=smoothgrad_samples,
-            attention_grid_size=grid_size,
-        )
-    elif arch == "dinov2":
-        grid_size = 16
-        model = create_dinov2_imagenet_model(device=device)
-        order = get_vit_block_names(model)
-        gradcam_layer = model.patch_embed.proj
-        methods = list(VIT_SALIENCY_METHODS)
-        compute_fn = make_saliency_compute_fn(
-            model,
-            gradcam_layer,
-            grid_size=grid_size,
-            ig_steps=ig_steps,
-            smoothgrad_stdev=smoothgrad_stdev,
-            smoothgrad_samples=smoothgrad_samples,
-            attention_grid_size=grid_size,
-        )
-    else:
-        raise ValueError("Unknown arch: %s (use resnet50|vit|dinov2)" % arch)
-    return model, order, dataset, compute_fn, methods
+    model, order, cascade_context, compute_fn, methods, _grid = _build_arch_runtime(
+        arch,
+        device,
+        ig_steps=ig_steps,
+        smoothgrad_stdev=smoothgrad_stdev,
+        smoothgrad_samples=smoothgrad_samples,
+        image_size=image_size,
+        ig_baseline=ig_baseline,
+    )
+    return model, order, dataset, compute_fn, methods, cascade_context
 
 
 def run_qual_bundle_pipeline(
@@ -785,6 +1043,7 @@ def run_qual_bundle_pipeline(
     force: bool = False,
     target_mode: TargetMode = "dynamic",
     seed: int = 42,
+    ig_baseline: IgBaseline = "zero",
 ) -> int:
     """Build qual_bundle.npz for paper cascade figures. Returns image index used."""
     if arch not in ARCH_SALIENCY_METHODS:
@@ -800,7 +1059,7 @@ def run_qual_bundle_pipeline(
     elif image_index_mode != "fixed":
         raise ValueError("image_index_mode must be 'fixed' or 'auto_ssim'")
 
-    model, order, dataset, compute_fn, methods = _setup_arch_model(
+    model, order, dataset, compute_fn, methods, cascade_context = _setup_arch_model(
         arch,
         imagenet_root,
         num_images,
@@ -809,6 +1068,7 @@ def run_qual_bundle_pipeline(
         ig_steps,
         smoothgrad_stdev,
         smoothgrad_samples,
+        ig_baseline=ig_baseline,
     )
     build_qual_bundle(
         model,
@@ -818,6 +1078,7 @@ def run_qual_bundle_pipeline(
         compute_fn,
         results_dir,
         device,
+        cascade_context,
         image_index=image_index,
         force=force,
         target_mode=target_mode,
@@ -916,14 +1177,18 @@ def run_mechanistic(
 
 def make_saliency_compute_fn(
     model: nn.Module,
-    gradcam_layer: nn.Module,
+    arch: str,
+    cascade_context: CascadeContext,
     *,
+    gradcam_layer: nn.Module | None = None,
+    transformer_gradcam_layer: nn.Module | None = None,
     grid_size: int | None = None,
     ig_steps: int = 50,
     smoothgrad_stdev: float = 0.15,
     smoothgrad_samples: int = 25,
     attention_grid_size: int | None = None,
-    map_norm: MapNorm = "abs",
+    ig_baseline: IgBaseline = "zero",
+    map_norm: MapNorm = "raw",
 ) -> Callable[[str, torch.Tensor, torch.Tensor], np.ndarray]:
     """Dispatch saliency method name -> batched attribution maps."""
 
@@ -944,25 +1209,56 @@ def make_saliency_compute_fn(
         if method == "gbp":
             return compute_gbp(model, batch, tgt, map_norm=map_norm)
         if method == "gradcam":
+            if gradcam_layer is None:
+                raise ValueError("gradcam requested but gradcam_layer is None")
             return compute_gradcam(
                 model, batch, tgt, gradcam_layer, grid_size=grid_size, map_norm=map_norm
             )
+        if method == "transformer_gradcam":
+            if transformer_gradcam_layer is None or grid_size is None:
+                raise ValueError("transformer_gradcam requires layer and grid_size")
+            return compute_transformer_gradcam(
+                model, batch, transformer_gradcam_layer, grid_size=grid_size
+            )
         if method == "gbp_gc":
+            if gradcam_layer is None:
+                raise ValueError("gbp_gc requested but gradcam_layer is None")
             return compute_gbp_gc(model, batch, tgt, gradcam_layer, map_norm=map_norm)
         if method == "ig":
-            return compute_ig(model, batch, tgt, ig_steps, map_norm=map_norm)
+            return compute_ig(
+                model,
+                batch,
+                tgt,
+                ig_steps,
+                map_norm=map_norm,
+                ig_baseline=ig_baseline,
+            )
         if attention_grid_size is not None:
+            rand_indices = get_randomized_block_indices(
+                arch, cascade_context.depth, cascade_context.order
+            )
             if method == "raw_attn":
                 return np.stack(
                     [
-                        get_raw_attention(model, batch[i : i + 1], attention_grid_size)
+                        get_raw_attention(
+                            model,
+                            batch[i : i + 1],
+                            attention_grid_size,
+                            apply_rms_norm=False,
+                        )
                         for i in range(batch.shape[0])
                     ]
                 )
             if method == "rollout":
                 return np.stack(
                     [
-                        get_rollout(model, batch[i : i + 1], attention_grid_size)
+                        get_rollout(
+                            model,
+                            batch[i : i + 1],
+                            attention_grid_size,
+                            randomized_block_indices=rand_indices,
+                            apply_rms_norm=False,
+                        )
                         for i in range(batch.shape[0])
                     ]
                 )
@@ -977,10 +1273,10 @@ def _ensure_shared_metadata(
     all_targets: torch.Tensor,
     order: List[str],
     arch: str,
-    methods: Sequence[str],
     target_mode: TargetMode,
     seed: int,
     num_images: int,
+    ig_baseline: IgBaseline = "zero",
 ) -> None:
     np.save(results_dir / "image_indices.npy", np.array(image_indices))
     np.save(results_dir / "target_indices.npy", all_targets.numpy())
@@ -990,7 +1286,19 @@ def _ensure_shared_metadata(
     write_experiment_config(
         results_dir,
         arch=arch,
-        methods=list(methods),
+        methods_class_a=list(METHODS_CLASS_A),
+        methods_class_b=list(METHODS_CLASS_B[arch]),
+        methods_class_c=list(METHODS_CLASS_C[arch]),
+        methods_reference=list(METHODS_REFERENCE[arch]),
+        ig_baseline=ig_baseline,
+        normalization_primary="rms",
+        normalization_legacy="maxabs",
+        primary_metric_ig="spearman_div_rms",
+        primary_metric_input_grad="spearman_div_rms",
+        primary_metric_others="spearman_abs_rms",
+        gradcam_target=GRADCAM_TARGET_BY_ARCH[arch],
+        rollout_mode="pretrained_prefix_only",
+        dinov2_probe_assertion_threshold=0.70,
         target_mode=target_mode,
         resnet_randomization=resnet_randomization,
         seed=seed,
@@ -1004,32 +1312,128 @@ def validate_dinov2_classifier(
     loader: DataLoader,
     device: str,
     num_probe: int = 10,
-    min_top1_acc: float = 0.05,
-    min_mean_confidence: float = 0.05,
+    min_top1_acc: float = 0.70,
 ) -> None:
     """Fail fast if DINOv2 ImageNet head looks untrained."""
-    correct, conf_sum, n = 0, 0.0, 0
+    correct, n = 0, 0
     with torch.no_grad():
         for images, labels in loader:
             images = images.to(device)
             labels = labels.to(device)
             logits = model(images)
             preds = logits.argmax(dim=1)
-            probs = torch.softmax(logits, dim=1)
-            conf_sum += probs.max(dim=1).values.sum().item()
             correct += (preds == labels).sum().item()
             n += images.shape[0]
             if n >= num_probe:
                 break
     if n == 0:
         raise RuntimeError("DINOv2 validation probe: empty loader.")
-    acc = correct / n
-    mean_conf = conf_sum / n
-    if acc < min_top1_acc or mean_conf < min_mean_confidence:
-        raise RuntimeError(
-            "DINOv2 classifier probe failed (acc=%.3f, mean_conf=%.3f). "
-            "Load a trained ImageNet linear head before large runs."
-            % (acc, mean_conf)
+    top1 = correct / n
+    assert top1 >= min_top1_acc, (
+        "DINOv2 top-1=%.3f < %.2f. Wrong model — use "
+        "torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_lc'). "
+        "Do NOT use timm vit_base_patch14_dinov2 with num_classes=1000 (untrained head)."
+        % (top1, min_top1_acc)
+    )
+
+
+def _run_arch_pipeline(
+    arch: str,
+    imagenet_root: Path,
+    results_dir: Path,
+    methods: Sequence[str],
+    num_images: int = 500,
+    image_size: int = 224,
+    batch_size: int = 8,
+    device: str = "cuda",
+    ig_steps: int = 50,
+    smoothgrad_stdev: float = 0.15,
+    smoothgrad_samples: int = 25,
+    skip_qual: bool = False,
+    target_mode: TargetMode = "dynamic",
+    force_recompute: bool = False,
+    seed: int = 42,
+    ig_baseline: IgBaseline = "zero",
+) -> None:
+    set_seed(seed)
+    validate_imagenet_root(imagenet_root)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    if arch == "dinov2":
+        dataset, image_indices = load_dinov2_imagenet_subset(
+            imagenet_root, num_images, image_size=image_size
+        )
+    else:
+        dataset, image_indices = load_imagenet_subset(
+            imagenet_root,
+            num_images,
+            image_size=image_size,
+            transform=build_transform(image_size),
+        )
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    model, order, cascade_context, compute_fn, _all_methods, _grid = _build_arch_runtime(
+        arch,
+        device,
+        ig_steps=ig_steps,
+        smoothgrad_stdev=smoothgrad_stdev,
+        smoothgrad_samples=smoothgrad_samples,
+        image_size=image_size,
+        ig_baseline=ig_baseline,
+    )
+    if arch == "dinov2" and num_images >= 50:
+        validate_dinov2_classifier(model, loader, device)
+
+    scored_methods = [m for m in methods if m in METHODS_SCORED[arch]]
+    all_images, all_targets = load_all_images(loader, model, device)
+    _ensure_shared_metadata(
+        results_dir,
+        image_indices,
+        all_targets,
+        order,
+        arch,
+        target_mode,
+        seed,
+        num_images,
+        ig_baseline=ig_baseline,
+    )
+    compute_baseline_maps(
+        model,
+        all_images,
+        all_targets,
+        scored_methods,
+        compute_fn,
+        results_dir,
+        batch_size,
+        device,
+        force_recompute=force_recompute,
+    )
+    run_cascading_experiment(
+        model,
+        order,
+        all_images,
+        all_targets,
+        scored_methods,
+        compute_fn,
+        results_dir,
+        batch_size,
+        device,
+        arch,
+        cascade_context,
+        target_mode=target_mode,
+        force_recompute=force_recompute,
+    )
+    if not skip_qual:
+        build_qual_bundle(
+            model,
+            order,
+            dataset,
+            methods,
+            compute_fn,
+            results_dir,
+            device,
+            cascade_context,
+            target_mode=target_mode,
         )
 
 
@@ -1048,6 +1452,7 @@ def run_arch_method_pipeline(
     target_mode: TargetMode = "dynamic",
     force_recompute: bool = False,
     seed: int = 42,
+    ig_baseline: IgBaseline = "zero",
 ) -> None:
     """Run cascading sanity check for a single architecture + method (parallel Modal workers)."""
     if arch not in ARCH_SALIENCY_METHODS:
@@ -1056,102 +1461,63 @@ def run_arch_method_pipeline(
     if method not in allowed:
         raise ValueError("Method %r not valid for arch %r (allowed: %s)" % (method, arch, allowed))
 
-    set_seed(seed)
-    validate_imagenet_root(imagenet_root)
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    if arch == "dinov2":
+    if method == "dino_attn":
+        set_seed(seed)
+        validate_imagenet_root(imagenet_root)
+        results_dir.mkdir(parents=True, exist_ok=True)
+        if arch != "dinov2":
+            raise ValueError("dino_attn is only valid for dinov2")
         dataset, image_indices = load_dinov2_imagenet_subset(
             imagenet_root, num_images, image_size=image_size
         )
-    else:
-        dataset, image_indices = load_imagenet_subset(
-            imagenet_root,
-            num_images,
-            image_size=image_size,
-            transform=build_transform(image_size),
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+        model, order, cascade_context, _compute_fn, _, _ = _build_arch_runtime(
+            arch, device, image_size=image_size, ig_baseline=ig_baseline
         )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-
-    if arch == "resnet50":
-        model = timm.create_model("resnet50", pretrained=True).to(device).eval()
-        order = get_resnet_block_names(model)
-        gradcam_layer = model.layer4[-1]
-        fn_kw = dict(
-            ig_steps=ig_steps,
-            smoothgrad_stdev=smoothgrad_stdev,
-            smoothgrad_samples=smoothgrad_samples,
-        )
-    elif arch == "vit":
-        model_name = "vit_base_patch16_224"
-        grid_size = 14
-        model = timm.create_model(model_name, pretrained=True, img_size=image_size).to(device).eval()
-        order = get_vit_block_names(model)
-        gradcam_layer = model.patch_embed.proj
-        fn_kw = dict(
-            grid_size=grid_size,
-            ig_steps=ig_steps,
-            smoothgrad_stdev=smoothgrad_stdev,
-            smoothgrad_samples=smoothgrad_samples,
-            attention_grid_size=grid_size,
-        )
-    elif arch == "dinov2":
-        grid_size = 16
-        model = create_dinov2_imagenet_model(device=device)
         if num_images >= 50:
             validate_dinov2_classifier(model, loader, device)
-        order = get_vit_block_names(model)
-        gradcam_layer = model.patch_embed.proj
-        fn_kw = dict(
-            grid_size=grid_size,
-            ig_steps=ig_steps,
-            smoothgrad_stdev=smoothgrad_stdev,
-            smoothgrad_samples=smoothgrad_samples,
-            attention_grid_size=grid_size,
+        img, _ = dataset[0]
+        inp = img[None].to(device)
+        ref = get_dino_reference_attn(
+            model, inp, grid_size=cascade_context.grid_size, out_size=224
         )
-    else:
-        raise ValueError("Unknown arch: %s" % arch)
+        qual_path = results_dir / "qual_bundle.npz"
+        existing = {}
+        if qual_path.exists():
+            data = np.load(qual_path, allow_pickle=True)
+            existing = {k: data[k] for k in data.files}
+        existing["dino_reference_attn"] = ref
+        np.savez_compressed(qual_path, **existing)
+        _ensure_shared_metadata(
+            results_dir,
+            image_indices,
+            torch.tensor([0]),
+            order,
+            arch,
+            target_mode,
+            seed,
+            num_images,
+            ig_baseline=ig_baseline,
+        )
+        return
 
-    compute_fn = make_saliency_compute_fn(model, gradcam_layer, map_norm="abs", **fn_kw)
-    compute_fn_div = make_saliency_compute_fn(model, gradcam_layer, map_norm="diverging", **fn_kw)
-
-    all_images, all_targets = load_all_images(loader, model, device)
-    _ensure_shared_metadata(
-        results_dir,
-        image_indices,
-        all_targets,
-        order,
-        arch,
-        [method],
-        target_mode,
-        seed,
-        num_images,
-    )
-    compute_baseline_maps(
-        model,
-        all_images,
-        all_targets,
-        [method],
-        compute_fn,
-        compute_fn_div,
-        results_dir,
-        batch_size,
-        device,
-        force_recompute=force_recompute,
-    )
-    run_cascading_experiment(
-        model,
-        order,
-        all_images,
-        all_targets,
-        [method],
-        compute_fn,
-        compute_fn_div,
-        results_dir,
-        batch_size,
-        device,
+    _run_arch_pipeline(
+        arch=arch,
+        imagenet_root=imagenet_root,
+        results_dir=results_dir,
+        methods=[method],
+        num_images=num_images,
+        image_size=image_size,
+        batch_size=batch_size,
+        device=device,
+        ig_steps=ig_steps,
+        smoothgrad_stdev=smoothgrad_stdev,
+        smoothgrad_samples=smoothgrad_samples,
+        skip_qual=True,
         target_mode=target_mode,
         force_recompute=force_recompute,
+        seed=seed,
+        ig_baseline=ig_baseline,
     )
 
 
@@ -1169,43 +1535,26 @@ def run_resnet50_pipeline(
     target_mode: TargetMode = "dynamic",
     force_recompute: bool = False,
     seed: int = 42,
+    ig_baseline: IgBaseline = "zero",
 ) -> None:
-    set_seed(seed)
-    validate_imagenet_root(imagenet_root)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    methods = list(RESNET50_SALIENCY_METHODS)
-
-    transform = build_transform(image_size)
-    dataset, image_indices = load_imagenet_subset(imagenet_root, num_images, transform=transform)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-
-    model = timm.create_model("resnet50", pretrained=True).to(device).eval()
-    order = get_resnet_block_names(model)
-    gradcam_layer = model.layer4[-1]
-    fn_kw = dict(
+    _run_arch_pipeline(
+        arch="resnet50",
+        imagenet_root=imagenet_root,
+        results_dir=results_dir,
+        methods=METHODS_BY_ARCH["resnet50"],
+        num_images=num_images,
+        image_size=image_size,
+        batch_size=batch_size,
+        device=device,
         ig_steps=ig_steps,
         smoothgrad_stdev=smoothgrad_stdev,
         smoothgrad_samples=smoothgrad_samples,
+        skip_qual=skip_qual,
+        target_mode=target_mode,
+        force_recompute=force_recompute,
+        seed=seed,
+        ig_baseline=ig_baseline,
     )
-    compute_fn = make_saliency_compute_fn(model, gradcam_layer, map_norm="abs", **fn_kw)
-    compute_fn_div = make_saliency_compute_fn(model, gradcam_layer, map_norm="diverging", **fn_kw)
-
-    all_images, all_targets = load_all_images(loader, model, device)
-    _ensure_shared_metadata(
-        results_dir, image_indices, all_targets, order, "resnet50", methods, target_mode, seed, num_images
-    )
-    compute_baseline_maps(
-        model, all_images, all_targets, methods, compute_fn, compute_fn_div,
-        results_dir, batch_size, device, force_recompute=force_recompute,
-    )
-    run_cascading_experiment(
-        model, order, all_images, all_targets, methods, compute_fn, compute_fn_div,
-        results_dir, batch_size, device, target_mode=target_mode, force_recompute=force_recompute,
-    )
-    if not skip_qual:
-        build_qual_bundle(
-            model, order, dataset, methods, compute_fn, results_dir, device, target_mode=target_mode
-        )
 
 
 def run_vit_pipeline(
@@ -1225,62 +1574,45 @@ def run_vit_pipeline(
     target_mode: TargetMode = "dynamic",
     force_recompute: bool = False,
     seed: int = 42,
+    ig_baseline: IgBaseline = "zero",
 ) -> None:
-    set_seed(seed)
-    validate_imagenet_root(imagenet_root)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    methods = list(VIT_SALIENCY_METHODS) if use_attention else list(SHARED_SALIENCY_METHODS)
-    arch_tag = "dinov2" if "dinov2" in model_name else "vit"
-
     if "dinov2" in model_name:
-        dataset, image_indices = load_dinov2_imagenet_subset(
-            imagenet_root, num_images, image_size=image_size
-        )
-    else:
-        dataset, image_indices = load_imagenet_subset(
-            imagenet_root,
-            num_images,
+        run_dinov2_pipeline(
+            imagenet_root=imagenet_root,
+            results_dir=results_dir,
+            num_images=num_images,
             image_size=image_size,
-            transform=build_transform(image_size),
+            batch_size=batch_size,
+            device=device,
+            ig_steps=ig_steps,
+            smoothgrad_stdev=smoothgrad_stdev,
+            smoothgrad_samples=smoothgrad_samples,
+            skip_qual=skip_qual,
+            target_mode=target_mode,
+            force_recompute=force_recompute,
+            seed=seed,
+            ig_baseline=ig_baseline,
         )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-
-    if "dinov2" in model_name:
-        model = create_dinov2_imagenet_model(device=device)
-        if num_images >= 50:
-            validate_dinov2_classifier(model, loader, device)
-    else:
-        model = timm.create_model(
-            model_name, pretrained=True, img_size=image_size
-        ).to(device).eval()
-    order = get_vit_block_names(model)
-    gradcam_layer = model.patch_embed.proj
-    fn_kw = dict(
-        grid_size=grid_size,
+        return
+    methods = METHODS_BY_ARCH["vit"] if use_attention else METHODS_CLASS_A
+    _run_arch_pipeline(
+        arch="vit",
+        imagenet_root=imagenet_root,
+        results_dir=results_dir,
+        methods=methods,
+        num_images=num_images,
+        image_size=image_size,
+        batch_size=batch_size,
+        device=device,
         ig_steps=ig_steps,
         smoothgrad_stdev=smoothgrad_stdev,
         smoothgrad_samples=smoothgrad_samples,
-        attention_grid_size=grid_size if use_attention else None,
+        skip_qual=skip_qual,
+        target_mode=target_mode,
+        force_recompute=force_recompute,
+        seed=seed,
+        ig_baseline=ig_baseline,
     )
-    compute_fn = make_saliency_compute_fn(model, gradcam_layer, map_norm="abs", **fn_kw)
-    compute_fn_div = make_saliency_compute_fn(model, gradcam_layer, map_norm="diverging", **fn_kw)
-
-    all_images, all_targets = load_all_images(loader, model, device)
-    _ensure_shared_metadata(
-        results_dir, image_indices, all_targets, order, arch_tag, methods, target_mode, seed, num_images
-    )
-    compute_baseline_maps(
-        model, all_images, all_targets, methods, compute_fn, compute_fn_div,
-        results_dir, batch_size, device, force_recompute=force_recompute,
-    )
-    run_cascading_experiment(
-        model, order, all_images, all_targets, methods, compute_fn, compute_fn_div,
-        results_dir, batch_size, device, target_mode=target_mode, force_recompute=force_recompute,
-    )
-    if not skip_qual:
-        build_qual_bundle(
-            model, order, dataset, methods, compute_fn, results_dir, device, target_mode=target_mode
-        )
 
 
 def run_dinov2_pipeline(
@@ -1297,12 +1629,13 @@ def run_dinov2_pipeline(
     target_mode: TargetMode = "dynamic",
     force_recompute: bool = False,
     seed: int = 42,
+    ig_baseline: IgBaseline = "zero",
 ) -> None:
-    run_vit_pipeline(
+    _run_arch_pipeline(
+        arch="dinov2",
         imagenet_root=imagenet_root,
         results_dir=results_dir,
-        model_name="vit_base_patch14_dinov2.lvd142m",
-        grid_size=16,
+        methods=METHODS_BY_ARCH["dinov2"],
         num_images=num_images,
         image_size=image_size,
         batch_size=batch_size,
@@ -1311,10 +1644,10 @@ def run_dinov2_pipeline(
         smoothgrad_stdev=smoothgrad_stdev,
         smoothgrad_samples=smoothgrad_samples,
         skip_qual=skip_qual,
-        use_attention=True,
         target_mode=target_mode,
         force_recompute=force_recompute,
         seed=seed,
+        ig_baseline=ig_baseline,
     )
 
 

@@ -222,15 +222,19 @@ def pick_qual_image_index(
     fallback: int = 0,
 ) -> int:
     """Pick image with largest SSIM drop (baseline vs fully randomized)."""
-    path = Path(results_dir) / ("%s_ssim.npy" % method)
+    path = Path(results_dir) / ("%s_ssim_abs_rms.npy" % method)
     if not path.exists():
-        for alt in ("gradient", "input_grad", "gradcam"):
-            alt_path = Path(results_dir) / ("%s_ssim.npy" % alt)
+        for alt in ("gradient", "input_grad", "gradcam", "transformer_gradcam"):
+            alt_path = Path(results_dir) / ("%s_ssim_abs_rms.npy" % alt)
             if alt_path.exists():
                 path = alt_path
                 break
         else:
-            return fallback
+            legacy = Path(results_dir) / ("%s_ssim.npy" % method)
+            if legacy.exists():
+                path = legacy
+            else:
+                return fallback
     ssim = np.load(path)
     if ssim.ndim != 2 or ssim.shape[1] == 0:
         return fallback

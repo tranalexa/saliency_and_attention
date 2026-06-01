@@ -65,7 +65,7 @@ _ROLLOUT_SIGNAL_THRESHOLD = 1e-6
 
 
 def _cls_to_spatial_map(
-    cls_weights: np.ndarray, grid_size: int, out_size: int = 224
+    cls_weights: np.ndarray, grid_size: int, out_size: int = 224, apply_rms_norm: bool = True
 ) -> np.ndarray:
     """Map CLS-to-patch weights to a 2D heatmap with primary RMS normalization.
 
@@ -84,7 +84,10 @@ def _cls_to_spatial_map(
     upsampled = F.interpolate(
         heatmap_t, size=(out_size, out_size), mode="bilinear", align_corners=False
     )
-    return normalize_rms(upsampled.squeeze().numpy())
+    out = upsampled.squeeze().numpy()
+    if apply_rms_norm:
+        return normalize_rms(out)
+    return out.astype(np.float64)
 
 
 def _uniform_spatial_map(out_size: int = 224) -> np.ndarray:
@@ -126,6 +129,7 @@ def get_raw_attention(
     grid_size: int | None = None,
     out_size: int = 224,
     return_entropy: bool = False,
+    apply_rms_norm: bool = True,
 ) -> np.ndarray | tuple[np.ndarray, float]:
     """
     Raw attention from last block: average heads, CLS -> patches, spatial map.
@@ -147,7 +151,9 @@ def get_raw_attention(
     cls_weights = attn[0].mean(dim=0)[0, 1:].detach().cpu().numpy()
     if grid_size is None:
         grid_size = int(np.sqrt(cls_weights.shape[0]))
-    spatial_map = _cls_to_spatial_map(cls_weights, grid_size, out_size)
+    spatial_map = _cls_to_spatial_map(
+        cls_weights, grid_size, out_size, apply_rms_norm=apply_rms_norm
+    )
     if return_entropy:
         return spatial_map, compute_attention_entropy(attn)
     return spatial_map
@@ -159,6 +165,7 @@ def get_rollout(
     grid_size: int | None = None,
     out_size: int = 224,
     randomized_block_indices: set[int] | None = None,
+    apply_rms_norm: bool = True,
 ) -> np.ndarray:
     """
     Attention rollout over the pretrained block prefix; returns HxW map.
@@ -200,7 +207,9 @@ def get_rollout(
     cls_weights = rollout[0, 1:].detach().cpu().numpy()
     if grid_size is None:
         grid_size = int(np.sqrt(cls_weights.shape[0]))
-    return _cls_to_spatial_map(cls_weights, grid_size, out_size)
+    return _cls_to_spatial_map(
+        cls_weights, grid_size, out_size, apply_rms_norm=apply_rms_norm
+    )
 
 
 def get_dino_reference_attn(

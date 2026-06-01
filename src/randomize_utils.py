@@ -121,3 +121,17 @@ def save_checkpoint(model: nn.Module) -> Dict[str, torch.Tensor]:
 def restore_checkpoint(model: nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
     """Restore model weights from a saved checkpoint."""
     model.load_state_dict(state_dict, strict=False)
+
+
+def get_randomized_block_indices(
+    arch: str, cascade_depth: int, randomization_order: List[str]
+) -> set[int]:
+    """Return transformer block indices randomized cumulatively through cascade_depth."""
+    if arch == "resnet50":
+        return set()
+    indices: set[int] = set()
+    for name in randomization_order[: cascade_depth + 1]:
+        m = _VIT_BLOCK_MODULE_RE.match(name)
+        if m:
+            indices.add(int(m.group(2)))
+    return indices

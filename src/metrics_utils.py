@@ -62,15 +62,29 @@ def compute_spearman(map_a: np.ndarray, map_b: np.ndarray) -> float:
     return float(result.correlation)
 
 
+def prepare_map_for_metric(
+    img: np.ndarray,
+    variant: str,
+) -> np.ndarray:
+    """Apply a metric-facing normalization variant to a raw signed map."""
+    arr = np.asarray(img, dtype=np.float64)
+    if variant == "signed_rms":
+        return normalize_rms(arr)
+    if variant == "abs_rms":
+        return normalize_rms(np.abs(arr))
+    if variant == "signed_maxabs":
+        return normalize_maxabs(arr)
+    if variant == "abs_maxabs":
+        return abs_grayscale_norm(arr)
+    raise ValueError("Unknown metric map variant: %s" % variant)
+
+
 def compute_ssim(map_a: np.ndarray, map_b: np.ndarray) -> float:
-    """Structural similarity between two HxW maps in [0, 1]."""
-    return float(
-        structural_similarity(
-            np.asarray(map_a, dtype=np.float64),
-            np.asarray(map_b, dtype=np.float64),
-            data_range=1.0,
-        )
-    )
+    """Structural similarity between two HxW maps."""
+    a = np.asarray(map_a, dtype=np.float64)
+    b = np.asarray(map_b, dtype=np.float64)
+    data_range = max(float(a.max() - a.min()), float(b.max() - b.min()), 1e-8)
+    return float(structural_similarity(a, b, data_range=data_range))
 
 
 def compute_logit_correlation(
