@@ -90,8 +90,8 @@ PRIMARY_SPEARMAN_VARIANT = {
 
 GRADCAM_TARGET_BY_ARCH = {
     "resnet50": "layer4[-1]",
-    "vit": "blocks[-1].norm2",
-    "dinov2": "blocks[-1].norm2",
+    "vit": "blocks[-2]",
+    "dinov2": "blocks[-2]",
 }
 
 MECHANISTIC_ARCH_TAG = {
@@ -536,32 +536,64 @@ def compute_gradcam(
     return np.stack(maps)
 
 
+def vit_reshape_transform(
+    tensor: torch.Tensor, height: int = 14, width: int = 14
+) -> torch.Tensor:
+    """Reshape ViT tokens to a spatial feature map for pytorch-grad-cam."""
+    result = tensor[:, 1:, :]
+    result = result.reshape(result.shape[0], height, width, result.shape[2])
+    result = result.transpose(2, 3).transpose(1, 2)
+    return result
+
+
+def dinov2_reshape_transform(
+    tensor: torch.Tensor, height: int = 16, width: int = 16
+) -> torch.Tensor:
+    """Reshape DINOv2 tokens to a spatial feature map for pytorch-grad-cam."""
+    result = tensor[:, 1:, :]
+    result = result.reshape(result.shape[0], height, width, result.shape[2])
+    result = result.transpose(2, 3).transpose(1, 2)
+    return result
+
+
 def compute_transformer_gradcam(
     model: nn.Module,
     images: torch.Tensor,
-    layer: nn.Module,
-    grid_size: int,
+    target_class: int,
+    arch: str,
     out_size: int = 224,
 ) -> np.ndarray:
-    """Architecture-native spatial attribution for ViT/DINOv2 (blocks[-1].norm2)."""
+    """
+    GradCAM for ViT/DINOv2 using pytorch-grad-cam.
+
+    Target layer: model.blocks[-2] (second-to-last transformer block).
+    Reshape function converts token sequence to spatial feature map.
+    Reference: Gildenblat (2022), pytorch-gradcam-book/HuggingFace.html
+    """
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+    target_layer = model.blocks[-2]
+
+    if arch == "vit":
+        reshape_transform = vit_reshape_transform
+    elif arch == "dinov2":
+        reshape_transform = dinov2_reshape_transform
+    else:
+        raise ValueError("Unknown arch for transformer gradcam: %s" % arch)
+
+    targets = [ClassifierOutputTarget(int(target_class))] * images.shape[0]
+    model.eval()
+    with GradCAM(
+        model=model,
+        target_layers=[target_layer],
+        reshape_transform=reshape_transform,
+    ) as cam:
+        grayscale_cam = cam(input_tensor=images, targets=targets)
+
     maps = []
-    for i in range(images.shape[0]):
-        inp = images[i : i + 1]
-        captured: list[torch.Tensor] = []
-
-        def hook(_module, _inp, output):
-            captured.append(output.detach())
-
-        handle = layer.register_forward_hook(hook)
-        model.eval()
-        with torch.no_grad():
-            model(inp)
-        handle.remove()
-
-        tokens = captured[0][0, 1:, :]
-        patch_scores = F.relu(tokens.mean(dim=-1))
-        heatmap = patch_scores.reshape(grid_size, grid_size).cpu().numpy()
-        heatmap_t = torch.from_numpy(heatmap).float()[None, None]
+    for i in range(grayscale_cam.shape[0]):
+        heatmap_t = torch.tensor(grayscale_cam[i]).float()[None, None]
         up = F.interpolate(
             heatmap_t, size=(out_size, out_size), mode="bilinear", align_corners=False
         )
@@ -961,8 +993,6 @@ def _build_arch_runtime(
             model,
             arch,
             cascade_context,
-            transformer_gradcam_layer=model.blocks[-1].norm2,
-            grid_size=grid_size,
             ig_steps=ig_steps,
             smoothgrad_stdev=smoothgrad_stdev,
             smoothgrad_samples=smoothgrad_samples,
@@ -980,8 +1010,6 @@ def _build_arch_runtime(
             model,
             arch,
             cascade_context,
-            transformer_gradcam_layer=model.blocks[-1].norm2,
-            grid_size=grid_size,
             ig_steps=ig_steps,
             smoothgrad_stdev=smoothgrad_stdev,
             smoothgrad_samples=smoothgrad_samples,
@@ -1181,7 +1209,6 @@ def make_saliency_compute_fn(
     cascade_context: CascadeContext,
     *,
     gradcam_layer: nn.Module | None = None,
-    transformer_gradcam_layer: nn.Module | None = None,
     grid_size: int | None = None,
     ig_steps: int = 50,
     smoothgrad_stdev: float = 0.15,
@@ -1215,10 +1242,13 @@ def make_saliency_compute_fn(
                 model, batch, tgt, gradcam_layer, grid_size=grid_size, map_norm=map_norm
             )
         if method == "transformer_gradcam":
-            if transformer_gradcam_layer is None or grid_size is None:
-                raise ValueError("transformer_gradcam requires layer and grid_size")
-            return compute_transformer_gradcam(
-                model, batch, transformer_gradcam_layer, grid_size=grid_size
+            return np.stack(
+                [
+                    compute_transformer_gradcam(
+                        model, batch[i : i + 1], int(tgt[i].item()), arch=arch
+                    )[0]
+                    for i in range(batch.shape[0])
+                ]
             )
         if method == "gbp_gc":
             if gradcam_layer is None:
