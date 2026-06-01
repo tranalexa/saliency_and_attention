@@ -50,15 +50,18 @@ The default cascade target policy is `dynamic`: explain the current model argmax
 
 ## Blurred-Occlusion Axis
 
-The occlusion axis uses baseline maps to rank non-overlapping saliency patches, then progressively replaces those patches with a blurred copy of the same normalized input. The blurred copy is made by denormalizing to image space, applying Gaussian blur, and re-normalizing.
+Following Binder et al. (2023) Section A.1, the occlusion axis loads existing baseline maps (does not recompute attributions), ranks non-overlapping 15×15 patches by absolute saliency, and replaces the top 30 highest-scoring patches with a blurred copy of the same normalized input. Gaussian blur uses kernel size 15 (matching patch size) in image space after denormalization.
 
-The target class is fixed at step 0 and is never re-argmaxed during deletion. Outputs per method:
+The target class is fixed at step 0 and is never re-argmaxed during deletion. AUC is the mean softmax confidence over the 30 post-occlusion steps (step 0 excluded). Lower AUC indicates more faithful attribution.
 
-- `{method}_occlusion_scores.npy`
-- `{method}_occlusion_curve.npy`
-- `{method}_occlusion_auc.npy`
-- `{method}_occlusion_auc_mean.npy`
+Outputs per method:
+
+- `occlusion_{method}_curve.npy` — `(N, 30)` softmax confidence after each replacement
+- `occlusion_{method}_auc.npy` — `(N,)` mean confidence over 30 steps per image
+- `occlusion_{method}_auc_mean.npy` — scalar mean AUC over all images
 - `occlusion_config.json`
+
+For full-grid deletion (opt-in via `--occlusion-patches`), outputs use the `_full` suffix: `occlusion_{method}_curve_full.npy`, `occlusion_{method}_auc_full.npy`.
 
 ## Mechanistic Controls
 

@@ -890,6 +890,11 @@ def run_cascading_experiment(
             )
 
 
+NUM_PATCHES_BINDER = 30  # Binder et al. Section A.1
+PATCH_SIZE_BINDER = 15  # Binder et al. Section A.1 main results
+PATCH_SIZE_BINDER_ALT = 8  # Binder appendix robustness check
+
+
 def normalize_images(tensor: torch.Tensor) -> torch.Tensor:
     mean = torch.tensor(IMAGENET_MEAN, device=tensor.device).view(1, 3, 1, 1)
     std = torch.tensor(IMAGENET_STD, device=tensor.device).view(1, 3, 1, 1)
@@ -957,9 +962,11 @@ def _blurred_deletion_curve(
     blurred: torch.Tensor,
     target_class: int,
     ranked_patches: Sequence[tuple[slice, slice]],
+    num_patches: int,
     eval_batch_size: int,
     device: str,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (confidences, curve) where confidences[0] is unoccluded and curve excludes step 0."""
     current = image.detach().clone()
     pending = [current.clone()]
     scores: list[np.ndarray] = []
@@ -970,13 +977,18 @@ def _blurred_deletion_curve(
             scores.append(_target_probabilities(model, batch, target_class))
             pending.clear()
 
-    for ys, xs in ranked_patches:
+    for ys, xs in ranked_patches[:num_patches]:
         current[:, ys, xs] = blurred[:, ys, xs]
         pending.append(current.clone())
         if len(pending) >= eval_batch_size:
             flush()
     flush()
-    return np.concatenate(scores, axis=0).astype(np.float64)
+    confidences = np.concatenate(scores, axis=0).astype(np.float64)
+    return confidences, confidences[1:]
+
+
+def _occlusion_output_suffix(num_patches: int, n_grid: int) -> str:
+    return "_full" if num_patches >= n_grid else ""
 
 
 def run_blurred_occlusion_faithfulness(
@@ -987,17 +999,25 @@ def run_blurred_occlusion_faithfulness(
     results_dir: Path,
     batch_size: int,
     device: str,
-    patch_size: int = 16,
-    stride: int = 16,
-    blur_kernel_size: int = 31,
+    patch_size: int = PATCH_SIZE_BINDER,
+    stride: int | None = None,
+    num_patches: int = NUM_PATCHES_BINDER,
+    blur_kernel_size: int | None = None,
     blur_sigma: float = 8.0,
     force_recompute: bool = False,
 ) -> None:
-    """Run fixed-target blurred-patch deletion and save normalized AUCs."""
+    """Run fixed-target blurred-patch deletion (Binder et al. Section A.1)."""
+    if stride is None:
+        stride = patch_size
+    if blur_kernel_size is None:
+        blur_kernel_size = patch_size
+
     results_dir.mkdir(parents=True, exist_ok=True)
     n_images, _channels, height, width = all_images.shape
     patch_slices = _patch_slices(height, width, patch_size, stride)
-    x_axis = np.linspace(0.0, 1.0, len(patch_slices) + 1, dtype=np.float64)
+    n_grid = len(patch_slices)
+    effective_patches = min(num_patches, n_grid)
+    output_suffix = _occlusion_output_suffix(effective_patches, n_grid)
     blurred_images = make_blurred_inputs(
         all_images.to(device),
         blur_kernel_size=blur_kernel_size,
@@ -1005,58 +1025,64 @@ def run_blurred_occlusion_faithfulness(
     ).cpu()
 
     for method in methods:
-        curve_path = results_dir / ("%s_occlusion_curve.npy" % method)
-        auc_path = results_dir / ("%s_occlusion_auc.npy" % method)
+        curve_path = results_dir / (
+            "occlusion_%s_curve%s.npy" % (method, output_suffix)
+        )
+        auc_path = results_dir / ("occlusion_%s_auc%s.npy" % (method, output_suffix))
         if curve_path.exists() and auc_path.exists() and not force_recompute:
             print("Skip occlusion", method)
             continue
 
         saliency_maps = load_baseline_maps(results_dir, method, norm="raw")
-        curves = np.full((n_images, len(x_axis)), np.nan, dtype=np.float64)
-        score_curves = np.full_like(curves, np.nan)
+        curves = np.full((n_images, effective_patches), np.nan, dtype=np.float64)
         aucs = np.full(n_images, np.nan, dtype=np.float64)
         method_bs = _method_batch_size(method, batch_size)
 
         for i in tqdm(range(n_images), desc="occlusion " + method):
             target_class = int(all_targets[i].item())
             ranked = _rank_patches_by_saliency(saliency_maps[i], patch_slices)
-            scores = _blurred_deletion_curve(
+            _confidences, curve = _blurred_deletion_curve(
                 model,
                 all_images[i],
                 blurred_images[i],
                 target_class,
                 ranked,
+                effective_patches,
                 method_bs,
                 device,
             )
-            normalizer = max(float(scores[0]), 1e-8)
-            normalized = scores / normalizer
-            score_curves[i] = scores
-            curves[i] = normalized
-            aucs[i] = float(np.trapezoid(normalized, x_axis))
+            curves[i] = curve
+            aucs[i] = float(np.mean(curve))
             _clear_cuda()
 
-        np.save(results_dir / ("%s_occlusion_scores.npy" % method), score_curves)
         np.save(curve_path, curves)
         np.save(auc_path, aucs)
-        np.save(results_dir / ("%s_occlusion_auc_mean.npy" % method), np.nanmean(aucs))
+        if not output_suffix:
+            np.save(
+                results_dir / ("occlusion_%s_auc_mean.npy" % method),
+                np.nanmean(aucs),
+            )
 
     with open(results_dir / "occlusion_config.json", "w") as f:
         json.dump(
             {
                 "patch_size": patch_size,
                 "stride": stride,
+                "num_patches": effective_patches,
                 "blur_kernel_size": blur_kernel_size,
                 "blur_sigma": blur_sigma,
                 "target_policy": "fixed_step0_target",
                 "score": "softmax_probability",
-                "curve": "target_probability_normalized_by_step0",
-                "auc": "trapezoid_over_fraction_deleted",
+                "curve": "target_probability_steps_1_to_N",
+                "auc": "mean_confidence_steps_1_to_N",
                 "methods": list(methods),
             },
             f,
             indent=2,
         )
+
+
+run_occlusion = run_blurred_occlusion_faithfulness
 
 
 def _qual_has_all_methods(qual_path: Path, methods: Sequence[str]) -> bool:
@@ -1672,9 +1698,10 @@ def run_occlusion_pipeline(
     force_recompute: bool = False,
     seed: int = 42,
     ig_baseline: IgBaseline = "zero",
-    patch_size: int = 16,
-    stride: int = 16,
-    blur_kernel_size: int = 31,
+    patch_size: int = PATCH_SIZE_BINDER,
+    stride: int | None = None,
+    num_patches: int = NUM_PATCHES_BINDER,
+    blur_kernel_size: int | None = None,
     blur_sigma: float = 8.0,
 ) -> None:
     """Run the blurred-occlusion faithfulness axis for one scoped architecture."""
@@ -1691,7 +1718,7 @@ def run_occlusion_pipeline(
         transform=build_transform(image_size),
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-    model, order, _cascade_context, compute_fn, methods, _grid = _build_arch_runtime(
+    model, order, _cascade_context, _compute_fn, methods, _grid = _build_arch_runtime(
         arch,
         device,
         ig_steps=ig_steps,
@@ -1701,6 +1728,12 @@ def run_occlusion_pipeline(
     if arch == "vit" and "raw_attn" in methods:
         first_img, _ = dataset[0]
         validate_raw_attention(model, first_img[None].to(device), name=arch)
+
+    missing = [m for m in methods if not _method_baseline_exists(results_dir, m)]
+    if missing:
+        raise FileNotFoundError(
+            "Missing baseline npz for: %s. Run cascade first." % missing
+        )
 
     all_images, all_targets = load_all_images(loader, model, device)
     _ensure_shared_metadata(
@@ -1715,17 +1748,6 @@ def run_occlusion_pipeline(
         ig_steps=ig_steps,
         ig_baseline=ig_baseline,
     )
-    compute_baseline_maps(
-        model,
-        all_images,
-        all_targets,
-        methods,
-        compute_fn,
-        results_dir,
-        batch_size,
-        device,
-        force_recompute=force_recompute,
-    )
     run_blurred_occlusion_faithfulness(
         model,
         all_images,
@@ -1736,6 +1758,7 @@ def run_occlusion_pipeline(
         device,
         patch_size=patch_size,
         stride=stride,
+        num_patches=num_patches,
         blur_kernel_size=blur_kernel_size,
         blur_sigma=blur_sigma,
         force_recompute=force_recompute,

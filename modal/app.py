@@ -362,9 +362,8 @@ def run_occlusion(
     seed: int = 42,
     ig_baseline: str = "zero",
     ig_steps: int = 50,
-    patch_size: int = 16,
-    stride: int = 16,
-    blur_kernel_size: int = 31,
+    occlusion_patches: int = 30,
+    occlusion_patch_size: int = 15,
     blur_sigma: float = 8.0,
 ):
     import sys
@@ -383,9 +382,8 @@ def run_occlusion(
         seed=seed,
         ig_baseline=ig_baseline,
         ig_steps=ig_steps,
-        patch_size=patch_size,
-        stride=stride,
-        blur_kernel_size=blur_kernel_size,
+        patch_size=occlusion_patch_size,
+        num_patches=occlusion_patches,
         blur_sigma=blur_sigma,
     )
     results_vol.commit()
@@ -518,9 +516,8 @@ def main(
     ig_baseline: str = "zero",
     ig_steps: int = 50,
     occlusion_arch: str = "all",
-    patch_size: int = 16,
-    stride: int = 16,
-    blur_kernel_size: int = 31,
+    occlusion_patches: int = 30,
+    occlusion_patch_size: int = 15,
     blur_sigma: float = 8.0,
 ):
     """
@@ -535,6 +532,8 @@ def main(
     ig_baseline: zero | mean (Integrated Gradients baseline)
     ig_steps: Integrated Gradients interpolation steps
     occlusion_arch: resnet50 | vit | all
+    occlusion_patches: top-K patches to occlude (30 = Binder A.1; use full grid for extended)
+    occlusion_patch_size: patch and blur kernel size (15 = Binder main; 8 = appendix)
     """
     if ig_baseline not in ("zero", "mean"):
         raise ValueError("ig_baseline must be 'zero' or 'mean'")
@@ -588,9 +587,8 @@ def main(
                 seed=primary_seed,
                 ig_baseline=ig_baseline,
                 ig_steps=ig_steps,
-                patch_size=patch_size,
-                stride=stride,
-                blur_kernel_size=blur_kernel_size,
+                occlusion_patches=occlusion_patches,
+                occlusion_patch_size=occlusion_patch_size,
                 blur_sigma=blur_sigma,
             )
             for arch in archs

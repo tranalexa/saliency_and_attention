@@ -75,9 +75,8 @@ modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim
 | `--ig-baseline` | `zero` | Integrated Gradients baseline: `zero` or `mean` |
 | `--ig-steps` | `50` | Integrated Gradients interpolation steps |
 | `--occlusion-arch` | `all` | `resnet50`, `vit`, or `all` for occlusion |
-| `--patch-size` | `16` | Occlusion patch size |
-| `--stride` | `16` | Occlusion patch stride |
-| `--blur-kernel-size` | `31` | Gaussian blur kernel for occlusion |
+| `--occlusion-patches` | `30` | Top-K patches to occlude (Binder A.1 default; increase for full-grid) |
+| `--occlusion-patch-size` | `15` | Patch and blur kernel size (15 = Binder main; 8 = appendix robustness) |
 | `--blur-sigma` | `8.0` | Gaussian blur sigma for occlusion |
 
 ## Results
@@ -110,4 +109,4 @@ Older volumes or local folders may contain `dinov2` or removed-method artifacts 
 
 ## Cost Notes
 
-Start with `--num-images 10`. Full cascade runs are GPU-heavy; `--parallel-methods` reduces wall-clock time but increases peak GPU concurrency. Occlusion is also expensive because each image is evaluated over many blurred deletion steps.
+Start with `--num-images 10`. Full cascade runs are GPU-heavy; `--parallel-methods` reduces wall-clock time but increases peak GPU concurrency. Occlusion is also expensive because each image requires 30 forward passes per method (Binder A.1 default).
