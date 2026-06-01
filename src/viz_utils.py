@@ -17,6 +17,7 @@ METHOD_DISPLAY_NAMES = {
     "input_grad": "Input-Grad",
     "ig": "Integrated\nGradients",
     "gradcam": "GradCAM",
+    "transformer_gradcam": "Transformer\nGradCAM",
     "gbp": "Guided\nBackProp",
     "gbp_gc": "GBP-GC",
     "raw_attn": "Raw\nAttention",
@@ -34,8 +35,8 @@ ARCH_TO_FAMILY = {
     "dinov2": ARCH_FAMILY_TRANSFORMER,
 }
 
-# ResNet-50 cascade labels aligned with Adebayo Inception figure naming
-# (top -> bottom: Mixed_7*, Mixed_6*, Mixed_5*, Conv2d_*). Maps block index within each stage.
+# Optional ResNet-50 labels aligned with Adebayo Inception figure naming.
+# Default figures now use actual ResNet module names.
 _RESNET_STAGE_MAX_BLOCK = {4: 2, 3: 5, 2: 3, 1: 2}
 _RESNET_STAGE_LABELS = {
     4: ["Mixed_7c", "Mixed_7b", "Mixed_7a"],
@@ -46,7 +47,7 @@ _RESNET_STAGE_LABELS = {
 
 
 def format_resnet_adebayo_label(layer_name: str) -> str:
-    """Map ResNet bottleneck conv1 names to Adebayo-style column labels (Mixed_7c, Conv2d_4a, Logits)."""
+    """Map ResNet bottleneck names to optional Adebayo-style column labels."""
     name = str(layer_name)
     if name == "fc":
         return "Logits"
@@ -61,6 +62,16 @@ def format_resnet_adebayo_label(layer_name: str) -> str:
         if 0 <= idx < len(labels):
             return labels[idx]
     return short_layer_label(name)
+
+
+def format_resnet_label(layer_name: str, adebayo_style: bool = False) -> str:
+    """Human-readable ResNet label; real module names by default."""
+    if adebayo_style:
+        return format_resnet_adebayo_label(layer_name)
+    name = str(layer_name)
+    if name == "fc":
+        return "fc"
+    return short_layer_label(name, max_len=12)
 
 
 def infer_arch_family(order: Sequence[str]) -> str:
@@ -82,7 +93,9 @@ def resolve_arch_family(arch: Optional[str], order: Sequence[str]) -> str:
     return infer_arch_family(order)
 
 
-def format_cascade_column_label(layer_name: str, arch_family: str) -> str:
+def format_cascade_column_label(
+    layer_name: str, arch_family: str, resnet_adebayo_labels: bool = False
+) -> str:
     """Human-readable column header; CNN vs transformer prefixes differ."""
     name = str(layer_name)
     if arch_family == ARCH_FAMILY_TRANSFORMER:
@@ -94,8 +107,176 @@ def format_cascade_column_label(layer_name: str, arch_family: str) -> str:
         if name == "fc":
             return "Classifier"
     if arch_family == ARCH_FAMILY_CNN:
-        return format_resnet_adebayo_label(name)
+        return format_resnet_label(name, adebayo_style=resnet_adebayo_labels)
     return short_layer_label(name)
+
+
+def first_resnet_layer4_depth(order: Sequence[str]) -> int | None:
+    """Depth where the ResNet GradCAM target stage is first randomized."""
+    for i, name in enumerate(order):
+        if str(name).startswith("layer4."):
+            return i
+    return None
+
+
+def add_resnet_gradcam_target_marker(
+    ax: plt.Axes,
+    order: Sequence[str],
+    *,
+    x_values: Sequence[float] | None = None,
+    label: str = "GradCAM target layer first randomized",
+) -> None:
+    """Draw a vertical marker where ResNet layer4 is first randomized."""
+    depth = first_resnet_layer4_depth(order)
+    if depth is None:
+        return
+    x = x_values[depth] if x_values is not None and depth < len(x_values) else depth
+    ax.axvline(x, color="black", linestyle="--", linewidth=1.0, alpha=0.75)
+    ax.text(
+        x,
+        0.98,
+        label,
+        rotation=90,
+        va="top",
+        ha="right",
+        fontsize=7,
+        transform=ax.get_xaxis_transform(),
+    )
+
+
+def add_dinov2_probe_backbone_separator(
+    ax: plt.Axes,
+    *,
+    x_values: Sequence[float] | None = None,
+    depth: int = 1,
+) -> None:
+    """Mark DINOv2's linear-probe-only depth versus SSL backbone depths."""
+    x = x_values[depth] if x_values is not None and depth < len(x_values) else depth
+    ax.axvline(x, color="black", linewidth=1.2, alpha=0.85)
+    ax.text(
+        0.02,
+        0.96,
+        "Linear probe",
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=8,
+    )
+    ax.text(
+        0.55,
+        0.96,
+        "Backbone (SSL features)",
+        transform=ax.transAxes,
+        va="top",
+        ha="center",
+        fontsize=8,
+    )
+    ax.text(
+        0.50,
+        0.05,
+        "Depth 0 randomizes the linear probe only; depths 1-12 randomize the DINO backbone.",
+        transform=ax.transAxes,
+        va="bottom",
+        ha="center",
+        fontsize=7,
+        alpha=0.8,
+    )
+
+
+def _load_logit_corr(results_root: Union[str, Path], arch: str) -> np.ndarray | None:
+    tag = {"resnet50": "resnet", "vit": "vit", "dinov2": "dinov2"}.get(arch, arch)
+    path = Path(results_root) / "mechanistic" / ("logit_corr_%s.npy" % tag)
+    if path.exists():
+        return np.load(path)
+    return None
+
+
+def add_logit_corr_band(
+    ax: plt.Axes,
+    results_root: Union[str, Path],
+    arch: str,
+    *,
+    x_values: Sequence[float] | None = None,
+    label: str = "Model output preservation (logit corr to pretrained)",
+    annotate_resnet_skip: bool = True,
+) -> plt.Axes | None:
+    """Overlay model-output preservation as a gray twin-axis control band."""
+    logit_corr = _load_logit_corr(results_root, arch)
+    if logit_corr is None:
+        return None
+    x = np.asarray(x_values if x_values is not None else np.arange(len(logit_corr)))
+    y = np.asarray(logit_corr, dtype=np.float64)
+    n = min(len(x), len(y))
+    if n == 0:
+        return None
+    twin = ax.twinx()
+    twin.fill_between(x[:n], 0.0, y[:n], color="0.85", alpha=0.55, label=label)
+    twin.plot(x[:n], y[:n], color="0.45", linewidth=1.0)
+    twin.set_ylim(0, 1)
+    twin.set_ylabel("logit corr", color="0.35", fontsize=8)
+    twin.tick_params(axis="y", labelsize=7, colors="0.35")
+    if arch == "resnet50" and annotate_resnet_skip:
+        ax.text(
+            0.02,
+            0.02,
+            "ResNet skip connections preserve logit correlation; sustained saliency similarity here may reflect architectural bypass.",
+            transform=ax.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=7,
+            alpha=0.78,
+            wrap=True,
+        )
+    return twin
+
+
+def load_raw_attention_entropy(results_dir: Union[str, Path]) -> np.ndarray | None:
+    """Load per-depth raw attention entropy means if present."""
+    paths = sorted(Path(results_dir).glob("raw_attn_entropy_depth*.npy"))
+    if not paths:
+        return None
+    vals = []
+    for path in paths:
+        arr = np.load(path)
+        vals.append(float(np.nanmean(arr)))
+    return np.array(vals, dtype=np.float64)
+
+
+def add_attention_entropy_overlay(
+    ax: plt.Axes,
+    results_dir: Union[str, Path],
+    *,
+    num_patches: int = 196,
+    x_values: Sequence[float] | None = None,
+) -> plt.Axes | None:
+    """Overlay raw-attention entropy and shade near-uniform collapse regions."""
+    entropy = load_raw_attention_entropy(results_dir)
+    if entropy is None:
+        return None
+    x = np.asarray(x_values if x_values is not None else np.arange(len(entropy)))
+    n = min(len(x), len(entropy))
+    if n == 0:
+        return None
+    entropy = entropy[:n]
+    x = x[:n]
+    threshold = 0.8 * np.log(num_patches)
+    twin = ax.twinx()
+    twin.plot(x, entropy, color="tab:red", linewidth=1.0, label="raw attention entropy")
+    twin.set_ylabel("attention entropy", color="tab:red", fontsize=8)
+    twin.tick_params(axis="y", labelsize=7, colors="tab:red")
+    collapsed = entropy > threshold
+    if np.any(collapsed):
+        ax.fill_between(
+            x,
+            0,
+            1,
+            where=collapsed,
+            transform=ax.get_xaxis_transform(),
+            color="tab:red",
+            alpha=0.10,
+            label="Attention collapsed - rollout unreliable",
+        )
+    return twin
 
 
 def short_layer_label(name: str, max_len: int = 9) -> str:
