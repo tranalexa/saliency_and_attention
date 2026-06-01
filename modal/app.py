@@ -6,6 +6,7 @@ Usage (from repo root):
   modal run modal/app.py --experiment all --num-images 500 --skip-qual --parallel-methods
   modal run modal/app.py --experiment resnet50 --num-images 10 --sequential
   modal run modal/app.py --experiment resnet50 --qual-only --image-index-mode auto_ssim
+  modal run modal/app.py --experiment vit --num-images 500 --seeds 42,1,2 --parallel-methods
 """
 from __future__ import annotations
 
@@ -52,6 +53,37 @@ volume_mounts = {IMAGENET_MOUNT: imagenet_vol, RESULTS_MOUNT: results_vol}
 SALIENCY_ARCHS = ("resnet50", "vit", "dinov2")
 
 
+def _parse_seeds(seeds: str) -> list[int]:
+    parsed = [int(s.strip()) for s in seeds.split(",") if s.strip()]
+    if not parsed:
+        raise ValueError("At least one seed is required in --seeds")
+    return parsed
+
+
+def _methods_for_arch(arch: str) -> list[str]:
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from experiment_utils import METHODS_BY_ARCH
+
+    return list(METHODS_BY_ARCH[arch])
+
+
+def _is_class_a_method(method: str) -> bool:
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from experiment_utils import METHODS_CLASS_A
+
+    return method in METHODS_CLASS_A
+
+
+def _results_subdir_for_method(arch: str, method: str, seed: int) -> str:
+    if _is_class_a_method(method):
+        return "%s/seed%d" % (arch, seed)
+    return arch
+
+
 def _run_pipeline(
     fn_name: str,
     results_subdir: str,
@@ -61,6 +93,7 @@ def _run_pipeline(
     force_recompute: bool = False,
     target_mode: str = "dynamic",
     seed: int = 42,
+    ig_baseline: str = "zero",
     **kwargs,
 ):
     import sys
@@ -85,6 +118,7 @@ def _run_pipeline(
         force_recompute=force_recompute,
         target_mode=target_mode,
         seed=seed,
+        ig_baseline=ig_baseline,
     )
     if fn_name == "mechanistic":
         fn(
@@ -138,6 +172,7 @@ def _run_single_method(
     force_recompute: bool = False,
     target_mode: str = "dynamic",
     seed: int = 42,
+    ig_baseline: str = "zero",
 ):
     import sys
 
@@ -148,13 +183,14 @@ def _run_single_method(
         arch=arch,
         method=method,
         imagenet_root=Path(IMAGENET_MOUNT),
-        results_dir=Path(RESULTS_MOUNT) / arch,
+        results_dir=Path(RESULTS_MOUNT) / _results_subdir_for_method(arch, method, seed),
         num_images=num_images,
         batch_size=batch_size,
         device="cuda",
         force_recompute=force_recompute,
         target_mode=target_mode,
         seed=seed,
+        ig_baseline=ig_baseline,
     )
     results_vol.commit()
 
@@ -167,6 +203,7 @@ def _run_qual(
     force: bool,
     target_mode: str = "dynamic",
     seed: int = 42,
+    ig_baseline: str = "zero",
 ):
     import sys
 
@@ -184,6 +221,7 @@ def _run_qual(
         force=force,
         target_mode=target_mode,
         seed=seed,
+        ig_baseline=ig_baseline,
     )
     print("qual_bundle for %s written (image_index=%d)" % (arch, idx))
     results_vol.commit()
@@ -202,10 +240,12 @@ def run_resnet50(
     force_recompute: bool = False,
     target_mode: str = "dynamic",
     seed: int = 42,
+    ig_baseline: str = "zero",
 ):
     _run_pipeline(
         "resnet50", "resnet50", num_images, batch_size, skip_qual,
         force_recompute=force_recompute, target_mode=target_mode, seed=seed,
+        ig_baseline=ig_baseline,
     )
 
 
@@ -222,10 +262,12 @@ def run_vit(
     force_recompute: bool = False,
     target_mode: str = "dynamic",
     seed: int = 42,
+    ig_baseline: str = "zero",
 ):
     _run_pipeline(
         "vit", "vit", num_images, batch_size, skip_qual,
         force_recompute=force_recompute, target_mode=target_mode, seed=seed,
+        ig_baseline=ig_baseline,
     )
 
 
@@ -242,10 +284,12 @@ def run_dinov2(
     force_recompute: bool = False,
     target_mode: str = "dynamic",
     seed: int = 42,
+    ig_baseline: str = "zero",
 ):
     _run_pipeline(
         "dinov2", "dinov2", num_images, batch_size, skip_qual,
         force_recompute=force_recompute, target_mode=target_mode, seed=seed,
+        ig_baseline=ig_baseline,
     )
 
 
@@ -282,8 +326,18 @@ def run_qual_bundle(
     force: bool = False,
     target_mode: str = "dynamic",
     seed: int = 42,
+    ig_baseline: str = "zero",
 ):
-    _run_qual(arch, num_images, image_index, image_index_mode, force, target_mode, seed)
+    _run_qual(
+        arch,
+        num_images,
+        image_index,
+        image_index_mode,
+        force,
+        target_mode,
+        seed,
+        ig_baseline,
+    )
 
 
 @app.function(
@@ -300,6 +354,7 @@ def run_saliency_method(
     force_recompute: bool = False,
     target_mode: str = "dynamic",
     seed: int = 42,
+    ig_baseline: str = "zero",
 ):
     _run_single_method(
         arch,
@@ -309,16 +364,8 @@ def run_saliency_method(
         force_recompute=force_recompute,
         target_mode=target_mode,
         seed=seed,
+        ig_baseline=ig_baseline,
     )
-
-
-def _methods_for_arch(arch: str) -> list[str]:
-    import sys
-
-    sys.path.insert(0, str(REPO_ROOT / "src"))
-    from experiment_utils import ARCH_SALIENCY_METHODS
-
-    return list(ARCH_SALIENCY_METHODS[arch])
 
 
 def _launch_arch_parallel(
@@ -327,22 +374,35 @@ def _launch_arch_parallel(
     batch_size: int,
     force_recompute: bool = False,
     target_mode: str = "dynamic",
-    seed: int = 42,
+    seeds: list[int] | None = None,
+    ig_baseline: str = "zero",
 ) -> list:
+    seeds = seeds or [42]
     methods = _methods_for_arch(arch)
-    print("Launching %d parallel method jobs for %s: %s" % (len(methods), arch, methods))
-    handles = [
-        run_saliency_method.spawn(
-            arch=arch,
-            method=method,
-            num_images=num_images,
-            batch_size=batch_size,
-            force_recompute=force_recompute,
-            target_mode=target_mode,
-            seed=seed,
-        )
-        for method in methods
-    ]
+    handles = []
+    for method in methods:
+        method_seeds = seeds if _is_class_a_method(method) else [seeds[0]]
+        for seed in method_seeds:
+            print(
+                "Launching %s/%s seed=%d (Class A multi-seed=%s)"
+                % (arch, method, seed, _is_class_a_method(method))
+            )
+            handles.append(
+                run_saliency_method.spawn(
+                    arch=arch,
+                    method=method,
+                    num_images=num_images,
+                    batch_size=batch_size,
+                    force_recompute=force_recompute,
+                    target_mode=target_mode,
+                    seed=seed,
+                    ig_baseline=ig_baseline,
+                )
+            )
+    print(
+        "Launched %d parallel method jobs for %s across seeds %s"
+        % (len(handles), arch, seeds)
+    )
     return handles
 
 
@@ -359,6 +419,7 @@ def _launch_qual(
     force: bool,
     target_mode: str = "dynamic",
     seed: int = 42,
+    ig_baseline: str = "zero",
 ) -> list:
     print("Launching qual_bundle job for", arch)
     return [
@@ -370,6 +431,7 @@ def _launch_qual(
             force=force,
             target_mode=target_mode,
             seed=seed,
+            ig_baseline=ig_baseline,
         )
     ]
 
@@ -389,6 +451,8 @@ def main(
     force_recompute: bool = False,
     target_mode: str = "dynamic",
     seed: int = 42,
+    seeds: str = "42",
+    ig_baseline: str = "zero",
 ):
     """
     experiment: resnet50 | vit | dinov2 | mechanistic | all
@@ -398,7 +462,14 @@ def main(
     image_index_mode: fixed | auto_ssim (pick demo image from existing SSIM arrays)
     force_recompute: ignore cached spearman/baseline npy (full rerun)
     target_mode: dynamic (per-depth argmax) | frozen_baseline
+    seeds: comma-separated RNG seeds; Class A methods run for each seed in seed subdirs
+    ig_baseline: zero | mean (Integrated Gradients baseline)
     """
+    if ig_baseline not in ("zero", "mean"):
+        raise ValueError("ig_baseline must be 'zero' or 'mean'")
+
+    seed_list = [seed] if seeds == "42" and seed != 42 else _parse_seeds(seeds)
+    primary_seed = seed_list[0]
     use_parallel_methods = parallel_methods and not sequential
 
     experiments = {
@@ -426,7 +497,8 @@ def main(
             handles.extend(
                 _launch_qual(
                     arch, num_images, image_index, image_index_mode, qual_force,
-                    target_mode=target_mode, seed=seed,
+                    target_mode=target_mode, seed=primary_seed,
+                    ig_baseline=ig_baseline,
                 )
             )
         _wait_handles(handles)
@@ -435,7 +507,24 @@ def main(
     def launch_arch(name: str) -> list:
         if name == "mechanistic" or not use_parallel_methods:
             bs = 16 if name == "mechanistic" else batch_size
+            run_seed = primary_seed
+            if not use_parallel_methods and len(seed_list) > 1 and name != "mechanistic":
+                print(
+                    "Note: sequential mode uses seed=%d only; "
+                    "use --parallel-methods for multi-seed Class A runs."
+                    % run_seed
+                )
             print("Launching sequential job:", name)
+            if name == "mechanistic":
+                return [
+                    experiments[name].spawn(
+                        num_images=num_images,
+                        batch_size=bs,
+                        skip_qual=skip_qual,
+                        force_recompute=force_recompute,
+                        seed=run_seed,
+                    )
+                ]
             return [
                 experiments[name].spawn(
                     num_images=num_images,
@@ -443,19 +532,27 @@ def main(
                     skip_qual=skip_qual,
                     force_recompute=force_recompute,
                     target_mode=target_mode,
-                    seed=seed,
+                    seed=run_seed,
+                    ig_baseline=ig_baseline,
                 )
             ]
 
         method_handles = _launch_arch_parallel(
-            name, num_images, batch_size, force_recompute, target_mode, seed
+            name,
+            num_images,
+            batch_size,
+            force_recompute,
+            target_mode,
+            seeds=seed_list,
+            ig_baseline=ig_baseline,
         )
         if skip_qual or name not in SALIENCY_ARCHS:
             return method_handles
         _wait_handles(method_handles)
         return _launch_qual(
             name, num_images, image_index, image_index_mode, qual_force,
-            target_mode=target_mode, seed=seed,
+            target_mode=target_mode, seed=primary_seed,
+            ig_baseline=ig_baseline,
         )
 
     if experiment == "all":
