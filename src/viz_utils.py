@@ -13,15 +13,12 @@ from metrics_utils import abs_grayscale_norm
 
 METHOD_DISPLAY_NAMES = {
     "gradient": "Gradient",
-    "smoothgrad": "SmoothGrad",
     "input_grad": "Input-Grad",
     "ig": "Integrated\nGradients",
     "gradcam": "GradCAM",
     "transformer_gradcam": "Transformer\nGradCAM",
     "gbp": "Guided\nBackProp",
-    "gbp_gc": "GBP-GC",
     "raw_attn": "Raw\nAttention",
-    "rollout": "Rollout",
 }
 
 
@@ -32,7 +29,6 @@ ARCH_FAMILY_TRANSFORMER = "transformer"
 ARCH_TO_FAMILY = {
     "resnet50": ARCH_FAMILY_CNN,
     "vit": ARCH_FAMILY_TRANSFORMER,
-    "dinov2": ARCH_FAMILY_TRANSFORMER,
 }
 
 # Optional ResNet-50 labels aligned with Adebayo Inception figure naming.
@@ -75,7 +71,7 @@ def format_resnet_label(layer_name: str, adebayo_style: bool = False) -> str:
 
 
 def infer_arch_family(order: Sequence[str]) -> str:
-    """Infer CNN (ResNet) vs transformer (ViT/DINOv2) from randomization order."""
+    """Infer CNN (ResNet) vs transformer (ViT) from randomization order."""
     for name in order:
         if re.match(r"blocks\.\d+$", str(name)):
             return ARCH_FAMILY_TRANSFORMER
@@ -144,47 +140,8 @@ def add_resnet_gradcam_target_marker(
     )
 
 
-def add_dinov2_probe_backbone_separator(
-    ax: plt.Axes,
-    *,
-    x_values: Sequence[float] | None = None,
-    depth: int = 1,
-) -> None:
-    """Mark DINOv2's linear-probe-only depth versus SSL backbone depths."""
-    x = x_values[depth] if x_values is not None and depth < len(x_values) else depth
-    ax.axvline(x, color="black", linewidth=1.2, alpha=0.85)
-    ax.text(
-        0.02,
-        0.96,
-        "Linear probe",
-        transform=ax.transAxes,
-        va="top",
-        ha="left",
-        fontsize=8,
-    )
-    ax.text(
-        0.55,
-        0.96,
-        "Backbone (SSL features)",
-        transform=ax.transAxes,
-        va="top",
-        ha="center",
-        fontsize=8,
-    )
-    ax.text(
-        0.50,
-        0.05,
-        "Depth 0 randomizes the linear probe only; depths 1-12 randomize the DINO backbone.",
-        transform=ax.transAxes,
-        va="bottom",
-        ha="center",
-        fontsize=7,
-        alpha=0.8,
-    )
-
-
 def _load_logit_corr(results_root: Union[str, Path], arch: str) -> np.ndarray | None:
-    tag = {"resnet50": "resnet", "vit": "vit", "dinov2": "dinov2"}.get(arch, arch)
+    tag = {"resnet50": "resnet", "vit": "vit"}.get(arch, arch)
     path = Path(results_root) / "mechanistic" / ("logit_corr_%s.npy" % tag)
     if path.exists():
         return np.load(path)
@@ -274,9 +231,48 @@ def add_attention_entropy_overlay(
             transform=ax.get_xaxis_transform(),
             color="tab:red",
             alpha=0.10,
-            label="Attention collapsed - rollout unreliable",
+            label="Attention near-uniform",
         )
     return twin
+
+
+def load_gradcam_zero_map_rate(results_dir: Union[str, Path]) -> np.ndarray | None:
+    """Load transformer GradCAM zero-map rates if present."""
+    path = Path(results_dir) / "transformer_gradcam_zero_map_rate.npy"
+    if not path.exists():
+        return None
+    return np.load(path)
+
+
+def add_gradcam_unreliable_overlay(
+    ax: plt.Axes,
+    results_dir: Union[str, Path],
+    *,
+    x_values: Sequence[float] | None = None,
+    threshold: float = 0.2,
+) -> plt.Axes | None:
+    """Shade cascade regions where transformer GradCAM zero maps are common."""
+    zero_rate = load_gradcam_zero_map_rate(results_dir)
+    if zero_rate is None:
+        return None
+    x = np.asarray(x_values if x_values is not None else np.arange(len(zero_rate)))
+    n = min(len(x), len(zero_rate))
+    if n == 0:
+        return None
+    x = x[:n]
+    unreliable = np.asarray(zero_rate[:n], dtype=np.float64) > threshold
+    if np.any(unreliable):
+        ax.fill_between(
+            x,
+            0,
+            1,
+            where=unreliable,
+            transform=ax.get_xaxis_transform(),
+            color="tab:orange",
+            alpha=0.12,
+            label="GradCAM unreliable (>20% zero maps)",
+        )
+    return ax
 
 
 def short_layer_label(name: str, max_len: int = 9) -> str:

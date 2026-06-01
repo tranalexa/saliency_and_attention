@@ -1,3 +1,66 @@
+# Experimental Protocol
+
+Cascading model randomization and blurred-occlusion faithfulness on ResNet-50 and ViT-B/16.
+
+## Scope
+
+| Dimension | Current Scope |
+|-----------|---------------|
+| Architectures | `resnet50`, `vit` |
+| Class A | `gradient`, `input_grad`, `ig` |
+| Class B | ResNet `gradcam`; ViT `transformer_gradcam` |
+| Class C | ResNet `gbp`; ViT `raw_attn` |
+| Removed | DINOv2, `smoothgrad`, `gbp_gc`, `rollout`, `dino_attn` |
+
+## Cascade Protocol
+
+| Setting | Behavior |
+|---------|----------|
+| Cascade order | Classifier first (`fc` / `head`), then top-to-bottom blocks |
+| ResNet randomization | Full Bottleneck module per step |
+| ViT randomization | Full transformer block per step |
+| Explanation class | `dynamic` by default; `frozen_baseline` for ablations |
+| Metrics | Spearman and SSIM against pretrained baseline maps |
+| Primary normalization | RMS |
+
+## Blurred-Occlusion Protocol
+
+1. Compute or load baseline maps for each scoped method.
+2. Denormalize each input, apply Gaussian blur in image space, then re-normalize.
+3. Rank patches by absolute saliency intensity.
+4. Replace patches in descending saliency order with the blurred copy.
+5. Keep the step-0 target class fixed throughout deletion.
+6. Save normalized deletion curves and AUCs.
+
+## Modal Rerun
+
+Delete or archive stale scoped folders before a clean rerun. The commands below do not remove old `dinov2` results; decide separately whether to archive or delete them.
+
+```bash
+modal volume rm saliency-results /resnet50 --recursive
+modal volume rm saliency-results /vit --recursive
+modal volume rm saliency-results /mechanistic --recursive
+
+modal run modal/app.py --experiment resnet50 --num-images 10 --sequential --force-recompute
+modal run modal/app.py --experiment all --num-images 500 --skip-qual --parallel-methods --force-recompute
+modal run modal/app.py --experiment mechanistic --num-images 500 --force-recompute
+modal run modal/app.py --experiment occlusion --num-images 500 --force-recompute
+modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim --qual-force
+
+./scripts/download_modal_results.sh
+jupyter notebook notebooks/notebook_analysis.ipynb
+```
+
+## Verification
+
+Confirm:
+
+- `randomization_order.json` starts with `fc` for ResNet and `head` for ViT.
+- `experiment_config.json` lists only scoped methods.
+- `gradcam_target` is `layer4[-1]` for ResNet and `blocks[-1].norm2` for ViT; ViT maps may log a fallback to `blocks[-2]` when the requested last-block norm produces zero maps.
+- No active result generation writes DINOv2 or removed-method outputs.
+- Occlusion outputs include `{method}_occlusion_curve.npy` and `{method}_occlusion_auc.npy`.
+- Cross-architecture summaries use sensitivity-ratio JSON/table outputs only.
 # Experimental protocol (PyTorch / Modal)
 
 Cascading model randomization sanity checks (Adebayo et al.) on ResNet-50, ViT-B/16, and DINOv2-B/14.

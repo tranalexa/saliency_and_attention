@@ -9,7 +9,7 @@ DEST="${ROOT}/results"
 cd "$ROOT"
 mkdir -p "$DEST"
 
-ARCHS=(resnet50 vit dinov2 mechanistic)
+ARCHS=(resnet50 vit mechanistic)
 FOUND=0
 
 for arch in "${ARCHS[@]}"; do

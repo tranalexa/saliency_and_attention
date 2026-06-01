@@ -37,10 +37,8 @@ _VIT_BLOCK_MODULE_RE = re.compile(r"^(?:(.+)\.)?blocks\.(\d+)$")
 
 
 def _vit_classifier_layer(model: nn.Module) -> str | None:
-    """Submodule path for the ImageNet classifier head (timm or hub DINOv2)."""
+    """Submodule path for the ImageNet classifier head."""
     for name, _ in model.named_parameters():
-        if name.endswith("linear_head.weight"):
-            return name[: -len(".weight")]
         if name.endswith("head.weight"):
             return name[: -len(".weight")]
         if name.endswith("fc.weight"):
@@ -49,7 +47,7 @@ def _vit_classifier_layer(model: nn.Module) -> str | None:
 
 
 def vit_blocks_prefix(model: nn.Module) -> str:
-    """Canonical blocks path prefix (``blocks`` for timm, ``backbone.blocks`` for hub DINOv2)."""
+    """Canonical transformer blocks path prefix."""
     prefix_counts: dict[str, int] = {}
     indices_by_prefix: dict[str, set[int]] = {}
     for name, _ in model.named_modules():
@@ -64,7 +62,7 @@ def vit_blocks_prefix(model: nn.Module) -> str:
         raise ValueError("Could not find ViT blocks in model.")
     return max(
         prefix_counts,
-        key=lambda p: (len(indices_by_prefix[p]), prefix_counts[p], p.startswith("backbone")),
+        key=lambda p: (len(indices_by_prefix[p]), prefix_counts[p], p),
     )
 
 
@@ -123,15 +121,3 @@ def restore_checkpoint(model: nn.Module, state_dict: Dict[str, torch.Tensor]) ->
     model.load_state_dict(state_dict, strict=False)
 
 
-def get_randomized_block_indices(
-    arch: str, cascade_depth: int, randomization_order: List[str]
-) -> set[int]:
-    """Return transformer block indices randomized cumulatively through cascade_depth."""
-    if arch == "resnet50":
-        return set()
-    indices: set[int] = set()
-    for name in randomization_order[: cascade_depth + 1]:
-        m = _VIT_BLOCK_MODULE_RE.match(name)
-        if m:
-            indices.add(int(m.group(2)))
-    return indices

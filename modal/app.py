@@ -3,6 +3,7 @@ Modal cloud runner for PyTorch sanity-check experiments.
 
 Usage (from repo root):
   modal run modal/app.py --experiment resnet50 --num-images 500 --skip-qual
+  modal run modal/app.py --experiment occlusion --num-images 100
   modal run modal/app.py --experiment all --num-images 500 --skip-qual --parallel-methods
   modal run modal/app.py --experiment resnet50 --num-images 10 --sequential
   modal run modal/app.py --experiment resnet50 --qual-only --image-index-mode auto_ssim
@@ -30,18 +31,17 @@ imagenet_vol = modal.Volume.from_name(IMAGENET_VOLUME, create_if_missing=True)
 results_vol = modal.Volume.from_name(RESULTS_VOLUME, create_if_missing=True)
 
 def _preload_pretrained_weights() -> None:
-    """Cache hub/timm weights on Modal at image build (per Meta README)."""
+    """Cache timm weights on Modal at image build."""
     import timm
-    import torch
 
     timm.create_model("resnet50", pretrained=True)
     timm.create_model("vit_base_patch16_224", pretrained=True, img_size=224)
-    torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14_lc", layers=1, pretrained=True)
-    print("Preloaded ResNet-50, ViT-B/16, dinov2_vitb14_lc.")
+    print("Preloaded ResNet-50 and ViT-B/16.")
 
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .apt_install("libgl1", "libglib2.0-0")
     .pip_install_from_requirements(str(REPO_ROOT / "requirements-pytorch.txt"))
     .env({"PYTHONPATH": "/root/src"})
     .run_function(_preload_pretrained_weights)
@@ -50,7 +50,7 @@ image = (
 
 volume_mounts = {IMAGENET_MOUNT: imagenet_vol, RESULTS_MOUNT: results_vol}
 
-SALIENCY_ARCHS = ("resnet50", "vit", "dinov2")
+SALIENCY_ARCHS = ("resnet50", "vit")
 
 
 def _parse_seeds(seeds: str) -> list[int]:
@@ -94,13 +94,13 @@ def _run_pipeline(
     target_mode: str = "dynamic",
     seed: int = 42,
     ig_baseline: str = "zero",
+    ig_steps: int = 50,
     **kwargs,
 ):
     import sys
 
     sys.path.insert(0, "/root/src")
     from experiment_utils import (
-        run_dinov2_pipeline,
         run_mechanistic_pipeline,
         run_resnet50_pipeline,
         run_vit_pipeline,
@@ -109,7 +109,6 @@ def _run_pipeline(
     fns = {
         "resnet50": run_resnet50_pipeline,
         "vit": run_vit_pipeline,
-        "dinov2": run_dinov2_pipeline,
         "mechanistic": run_mechanistic_pipeline,
     }
     fn = fns[fn_name]
@@ -119,6 +118,7 @@ def _run_pipeline(
         target_mode=target_mode,
         seed=seed,
         ig_baseline=ig_baseline,
+        ig_steps=ig_steps,
     )
     if fn_name == "mechanistic":
         fn(
@@ -140,16 +140,6 @@ def _run_pipeline(
             skip_qual=skip_qual,
             **pipe_kw,
             **kwargs,
-        )
-    elif fn_name == "dinov2":
-        fn(
-            imagenet_root=Path(IMAGENET_MOUNT),
-            results_dir=results_dir,
-            num_images=num_images,
-            batch_size=batch_size,
-            device="cuda",
-            skip_qual=skip_qual,
-            **pipe_kw,
         )
     else:
         fn(
@@ -173,6 +163,7 @@ def _run_single_method(
     target_mode: str = "dynamic",
     seed: int = 42,
     ig_baseline: str = "zero",
+    ig_steps: int = 50,
 ):
     import sys
 
@@ -191,6 +182,7 @@ def _run_single_method(
         target_mode=target_mode,
         seed=seed,
         ig_baseline=ig_baseline,
+        ig_steps=ig_steps,
     )
     results_vol.commit()
 
@@ -204,6 +196,7 @@ def _run_qual(
     target_mode: str = "dynamic",
     seed: int = 42,
     ig_baseline: str = "zero",
+    ig_steps: int = 50,
 ):
     import sys
 
@@ -222,6 +215,7 @@ def _run_qual(
         target_mode=target_mode,
         seed=seed,
         ig_baseline=ig_baseline,
+        ig_steps=ig_steps,
     )
     print("qual_bundle for %s written (image_index=%d)" % (arch, idx))
     results_vol.commit()
@@ -241,11 +235,12 @@ def run_resnet50(
     target_mode: str = "dynamic",
     seed: int = 42,
     ig_baseline: str = "zero",
+    ig_steps: int = 50,
 ):
     _run_pipeline(
         "resnet50", "resnet50", num_images, batch_size, skip_qual,
         force_recompute=force_recompute, target_mode=target_mode, seed=seed,
-        ig_baseline=ig_baseline,
+        ig_baseline=ig_baseline, ig_steps=ig_steps,
     )
 
 
@@ -263,33 +258,12 @@ def run_vit(
     target_mode: str = "dynamic",
     seed: int = 42,
     ig_baseline: str = "zero",
+    ig_steps: int = 50,
 ):
     _run_pipeline(
         "vit", "vit", num_images, batch_size, skip_qual,
         force_recompute=force_recompute, target_mode=target_mode, seed=seed,
-        ig_baseline=ig_baseline,
-    )
-
-
-@app.function(
-    image=image,
-    gpu=GPU_TYPE,
-    timeout=TIMEOUT_SEC,
-    volumes=volume_mounts,
-)
-def run_dinov2(
-    num_images: int = 500,
-    batch_size: int = 8,
-    skip_qual: bool = False,
-    force_recompute: bool = False,
-    target_mode: str = "dynamic",
-    seed: int = 42,
-    ig_baseline: str = "zero",
-):
-    _run_pipeline(
-        "dinov2", "dinov2", num_images, batch_size, skip_qual,
-        force_recompute=force_recompute, target_mode=target_mode, seed=seed,
-        ig_baseline=ig_baseline,
+        ig_baseline=ig_baseline, ig_steps=ig_steps,
     )
 
 
@@ -327,6 +301,7 @@ def run_qual_bundle(
     target_mode: str = "dynamic",
     seed: int = 42,
     ig_baseline: str = "zero",
+    ig_steps: int = 50,
 ):
     _run_qual(
         arch,
@@ -337,6 +312,7 @@ def run_qual_bundle(
         target_mode,
         seed,
         ig_baseline,
+        ig_steps,
     )
 
 
@@ -355,6 +331,7 @@ def run_saliency_method(
     target_mode: str = "dynamic",
     seed: int = 42,
     ig_baseline: str = "zero",
+    ig_steps: int = 50,
 ):
     _run_single_method(
         arch,
@@ -365,7 +342,51 @@ def run_saliency_method(
         target_mode=target_mode,
         seed=seed,
         ig_baseline=ig_baseline,
+        ig_steps=ig_steps,
     )
+
+
+@app.function(
+    image=image,
+    gpu=GPU_TYPE,
+    timeout=TIMEOUT_SEC,
+    volumes=volume_mounts,
+)
+def run_occlusion(
+    arch: str,
+    num_images: int = 500,
+    batch_size: int = 8,
+    force_recompute: bool = False,
+    seed: int = 42,
+    ig_baseline: str = "zero",
+    ig_steps: int = 50,
+    patch_size: int = 16,
+    stride: int = 16,
+    blur_kernel_size: int = 31,
+    blur_sigma: float = 8.0,
+):
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    from experiment_utils import run_occlusion_pipeline
+
+    run_occlusion_pipeline(
+        arch=arch,
+        imagenet_root=Path(IMAGENET_MOUNT),
+        results_dir=Path(RESULTS_MOUNT) / arch,
+        num_images=num_images,
+        batch_size=batch_size,
+        device="cuda",
+        force_recompute=force_recompute,
+        seed=seed,
+        ig_baseline=ig_baseline,
+        ig_steps=ig_steps,
+        patch_size=patch_size,
+        stride=stride,
+        blur_kernel_size=blur_kernel_size,
+        blur_sigma=blur_sigma,
+    )
+    results_vol.commit()
 
 
 def _launch_arch_parallel(
@@ -376,6 +397,7 @@ def _launch_arch_parallel(
     target_mode: str = "dynamic",
     seeds: list[int] | None = None,
     ig_baseline: str = "zero",
+    ig_steps: int = 50,
 ) -> list:
     seeds = seeds or [42]
     methods = _methods_for_arch(arch)
@@ -397,6 +419,7 @@ def _launch_arch_parallel(
                     target_mode=target_mode,
                     seed=seed,
                     ig_baseline=ig_baseline,
+                    ig_steps=ig_steps,
                 )
             )
     print(
@@ -420,6 +443,7 @@ def _launch_qual(
     target_mode: str = "dynamic",
     seed: int = 42,
     ig_baseline: str = "zero",
+    ig_steps: int = 50,
 ) -> list:
     print("Launching qual_bundle job for", arch)
     return [
@@ -432,6 +456,7 @@ def _launch_qual(
             target_mode=target_mode,
             seed=seed,
             ig_baseline=ig_baseline,
+            ig_steps=ig_steps,
         )
     ]
 
@@ -453,9 +478,15 @@ def main(
     seed: int = 42,
     seeds: str = "42",
     ig_baseline: str = "zero",
+    ig_steps: int = 50,
+    occlusion_arch: str = "all",
+    patch_size: int = 16,
+    stride: int = 16,
+    blur_kernel_size: int = 31,
+    blur_sigma: float = 8.0,
 ):
     """
-    experiment: resnet50 | vit | dinov2 | mechanistic | all
+    experiment: resnet50 | vit | mechanistic | occlusion | all
     parallel_methods: one GPU per saliency method (default on)
     sequential: run full pipeline on a single GPU (opt-out of parallel_methods)
     qual_only: only build qual_bundle.npz (no quant recompute)
@@ -464,6 +495,8 @@ def main(
     target_mode: dynamic (per-depth argmax) | frozen_baseline
     seeds: comma-separated RNG seeds; Class A methods run for each seed in seed subdirs
     ig_baseline: zero | mean (Integrated Gradients baseline)
+    ig_steps: Integrated Gradients interpolation steps
+    occlusion_arch: resnet50 | vit | all
     """
     if ig_baseline not in ("zero", "mean"):
         raise ValueError("ig_baseline must be 'zero' or 'mean'")
@@ -475,9 +508,11 @@ def main(
     experiments = {
         "resnet50": run_resnet50,
         "vit": run_vit,
-        "dinov2": run_dinov2,
         "mechanistic": run_mechanistic,
     }
+
+    if occlusion_arch not in (*SALIENCY_ARCHS, "all"):
+        raise ValueError("occlusion_arch must be resnet50|vit|all")
 
     def qual_archs_for_experiment(name: str) -> list[str]:
         if name == "all":
@@ -490,7 +525,7 @@ def main(
         archs = qual_archs_for_experiment(experiment)
         if not archs:
             raise ValueError(
-                "qual_only requires experiment resnet50|vit|dinov2|all (not mechanistic)"
+                "qual_only requires experiment resnet50|vit|all (not mechanistic|occlusion)"
             )
         handles = []
         for arch in archs:
@@ -498,9 +533,30 @@ def main(
                 _launch_qual(
                     arch, num_images, image_index, image_index_mode, qual_force,
                     target_mode=target_mode, seed=primary_seed,
-                    ig_baseline=ig_baseline,
+                    ig_baseline=ig_baseline, ig_steps=ig_steps,
                 )
             )
+        _wait_handles(handles)
+        return
+
+    if experiment == "occlusion":
+        archs = list(SALIENCY_ARCHS) if occlusion_arch == "all" else [occlusion_arch]
+        handles = [
+            run_occlusion.spawn(
+                arch=arch,
+                num_images=num_images,
+                batch_size=batch_size,
+                force_recompute=force_recompute,
+                seed=primary_seed,
+                ig_baseline=ig_baseline,
+                ig_steps=ig_steps,
+                patch_size=patch_size,
+                stride=stride,
+                blur_kernel_size=blur_kernel_size,
+                blur_sigma=blur_sigma,
+            )
+            for arch in archs
+        ]
         _wait_handles(handles)
         return
 
@@ -534,6 +590,7 @@ def main(
                     target_mode=target_mode,
                     seed=run_seed,
                     ig_baseline=ig_baseline,
+                    ig_steps=ig_steps,
                 )
             ]
 
@@ -545,6 +602,7 @@ def main(
             target_mode,
             seeds=seed_list,
             ig_baseline=ig_baseline,
+            ig_steps=ig_steps,
         )
         if skip_qual or name not in SALIENCY_ARCHS:
             return method_handles
@@ -552,17 +610,17 @@ def main(
         return _launch_qual(
             name, num_images, image_index, image_index_mode, qual_force,
             target_mode=target_mode, seed=primary_seed,
-            ig_baseline=ig_baseline,
+            ig_baseline=ig_baseline, ig_steps=ig_steps,
         )
 
     if experiment == "all":
         all_handles = []
-        for name in ["resnet50", "vit", "dinov2", "mechanistic"]:
+        for name in ["resnet50", "vit", "mechanistic"]:
             all_handles.extend(launch_arch(name))
         _wait_handles(all_handles)
         return
 
     if experiment not in experiments:
-        raise ValueError("Unknown experiment: %s (use resnet50|vit|dinov2|mechanistic|all)" % experiment)
+        raise ValueError("Unknown experiment: %s (use resnet50|vit|mechanistic|occlusion|all)" % experiment)
 
     _wait_handles(launch_arch(experiment))

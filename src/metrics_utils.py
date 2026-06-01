@@ -80,10 +80,27 @@ def prepare_map_for_metric(
 
 
 def compute_ssim(map_a: np.ndarray, map_b: np.ndarray) -> float:
-    """Structural similarity between two HxW maps."""
+    """
+    Compute SSIM between two signed attribution maps with dynamic data_range.
+
+    RMS normalization does not bound values to [0, 1] or [-1, 1], so fixed
+    data_range assumptions distort SSIM's stability constants.
+    """
     a = np.asarray(map_a, dtype=np.float64)
     b = np.asarray(map_b, dtype=np.float64)
-    data_range = max(float(a.max() - a.min()), float(b.max() - b.min()), 1e-8)
+    data_range = float(max(np.abs(a).max(), np.abs(b).max()) * 2)
+    if data_range < 1e-8:
+        return 1.0
+    return float(structural_similarity(a, b, data_range=data_range))
+
+
+def compute_ssim_abs(map_a: np.ndarray, map_b: np.ndarray) -> float:
+    """SSIM for non-negative attribution maps with dynamic data_range."""
+    a = np.asarray(map_a, dtype=np.float64)
+    b = np.asarray(map_b, dtype=np.float64)
+    data_range = float(max(a.max(), b.max()))
+    if data_range < 1e-8:
+        return 1.0
     return float(structural_similarity(a, b, data_range=data_range))
 
 

@@ -75,11 +75,11 @@ if __name__ == '__main__':
     computnormalmasks = options.normal_masks
 
     # default parameters
-    # pair saliency automatically computes smoothgrad squared
-    smoothgradsq = False  # turn off smoothgradsquared
+    # Pair saliency can square noisy-gradient samples; keep magnitude off.
+    noisy_grad_magnitude = False
     nsamples_sg = 50  # number of noisy samples to compute
     xsteps_ig = 50 # interpolation steps for integrated gradients
-    stdev_spread_sg = 0.15  # std for smoothgrad noisy samples
+    stdev_spread_sg = 0.15  # std for noisy-gradient samples
     gradcam_three_dims = True  # gradcam should be 3 channels
 
     # assemble a list of these images
@@ -112,10 +112,10 @@ if __name__ == '__main__':
         # dictionary of methods that we'll compute.
         saliency_methods = {
             'Gradient': saliency_dict['vng'].GetMask,
-            'SmoothGrad': saliency_dict['vng'].GetSmoothedMask,
+            'Smoothed Gradient': saliency_dict['vng'].GetSmoothedMask,
             'Guided\nBackProp': saliency_dict['gbp'].GetMask,
             'Integrated\nGradients': saliency_dict['ig'].GetMask,
-            'IG\nSmoothGrad': saliency_dict['ig'].GetSmoothedMask,
+            'IG\nSmoothed': saliency_dict['ig'].GetSmoothedMask,
             'GradCAM': saliency_dict['gc'].GetMask}
 
         for k, current_image in enumerate(demo_batch):
@@ -137,20 +137,20 @@ if __name__ == '__main__':
             # set up params for each saliency method.
             saliency_params = {
                 'Gradient': {"feed_dict": gen_feed_dict},
-                'SmoothGrad': {"feed_dict": gen_feed_dict,
+                'Smoothed Gradient': {"feed_dict": gen_feed_dict,
                                "stdev_spread": stdev_spread_sg,
                                "nsamples": nsamples_sg,
-                               "magnitude": smoothgradsq},
+                               "magnitude": noisy_grad_magnitude},
                 'Guided\nBackProp': {"feed_dict": gen_feed_dict},
                 'Integrated\nGradients': {"feed_dict": gen_feed_dict,
                                           "x_steps": xsteps_ig,
                                           "x_baseline": baseline},
-                'IG\nSmoothGrad': {"feed_dict": gen_feed_dict,
+                'IG\nSmoothed': {"feed_dict": gen_feed_dict,
                                    "x_steps": xsteps_ig,
                                    "nsamples": nsamples_sg,
                                    "stdev_spread": stdev_spread_sg,
                                    "x_baseline": baseline,
-                                   "magnitude": smoothgradsq},
+                                   "magnitude": noisy_grad_magnitude},
                 'GradCAM': {"feed_dict": gen_feed_dict,
                             "three_dims": gradcam_three_dims}}
 
@@ -166,7 +166,7 @@ if __name__ == '__main__':
             output_masks["Input-Grad"] = np.multiply(output_masks['Gradient'],
                                                      current_image)
 
-            output_masks["GBP-GC"] = np.multiply(
+            output_masks["GBP x GC"] = np.multiply(
                 output_masks['Guided\nBackProp'],
                 output_masks['GradCAM'])
 
@@ -217,10 +217,10 @@ if __name__ == '__main__':
         # dictionary of methods that we'll compute.
         saliency_methods = {
             'Gradient': saliency_dict['vng'].GetMask,
-            'SmoothGrad': saliency_dict['vng'].GetSmoothedMask,
+            'Smoothed Gradient': saliency_dict['vng'].GetSmoothedMask,
             'Guided\nBackProp': saliency_dict['gbp'].GetMask,
             'Integrated\nGradients': saliency_dict['ig'].GetMask,
-            'IG\nSmoothGrad': saliency_dict['ig'].GetSmoothedMask,
+            'IG\nSmoothed': saliency_dict['ig'].GetSmoothedMask,
             'GradCAM': saliency_dict['gc'].GetMask}
 
         # list to store collection of images
@@ -245,20 +245,20 @@ if __name__ == '__main__':
             # set up params for each saliency method.
             saliency_params = {
                 'Gradient': {"feed_dict": gen_feed_dict},
-                'SmoothGrad': {"feed_dict": gen_feed_dict,
+                'Smoothed Gradient': {"feed_dict": gen_feed_dict,
                                "stdev_spread": stdev_spread_sg,
                                "nsamples": nsamples_sg,
-                               "magnitude": smoothgradsq},
+                               "magnitude": noisy_grad_magnitude},
                 'Guided\nBackProp': {"feed_dict": gen_feed_dict},
                 'Integrated\nGradients': {"feed_dict": gen_feed_dict,
                                           "x_steps": xsteps_ig,
                                           "x_baseline": baseline},
-                'IG\nSmoothGrad': {"feed_dict": gen_feed_dict,
+                'IG\nSmoothed': {"feed_dict": gen_feed_dict,
                                    "x_steps": xsteps_ig,
                                    "nsamples": nsamples_sg,
                                    "stdev_spread": stdev_spread_sg,
                                    "x_baseline": baseline,
-                                   "magnitude": smoothgradsq},
+                                   "magnitude": noisy_grad_magnitude},
                 'GradCAM': {"feed_dict": gen_feed_dict,
                             "three_dims": gradcam_three_dims}}
 
@@ -274,7 +274,7 @@ if __name__ == '__main__':
             output_masks["Input-Grad"] = np.multiply(output_masks['Gradient'],
                                                      current_image)
 
-            output_masks["GBP-GC"] = np.multiply(
+            output_masks["GBP x GC"] = np.multiply(
                 output_masks['Guided\nBackProp'],
                 output_masks['GradCAM'])
 

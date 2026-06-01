@@ -72,10 +72,11 @@ work.
 
 ---
 
-## PyTorch extension (ViT, DINOv2, mechanistic checks)
+## PyTorch extension (ResNet-50, ViT-B/16, occlusion)
 
-This fork adds a **PyTorch + timm + Captum** pipeline that extends Adebayo's
-cascading model randomization test to modern architectures.
+This fork adds a **PyTorch + timm + Captum + pytorch-grad-cam** pipeline that
+extends Adebayo's cascading model randomization test to ResNet-50 and ViT-B/16,
+and adds a fixed-target blurred-occlusion faithfulness axis.
 
 ### Setup (virtual environment)
 
@@ -106,21 +107,20 @@ jupyter notebook notebooks/
 
 | Notebook | Purpose | Outputs |
 |----------|---------|---------|
-| `notebooks/notebook_resnet50_cascading.ipynb` | **Replication baseline** — ResNet-50, 7 saliency methods | `results/resnet50/` |
-| `notebooks/notebook_vit_cascading.ipynb` | ViT-B/16 — 7 methods (5 shared Captum + attention) | `results/vit/` |
-| `notebooks/notebook_dinov2_cascading.ipynb` | DINOv2-B/14 @ 224 — same 7-method set as ViT | `results/dinov2/` |
-| `notebooks/notebook_mechanistic.ipynb` | Logit correlation & activation scales (ResNet vs ViT vs DINOv2) | `results/mechanistic/` |
+| `notebooks/notebook_resnet50_cascading.ipynb` | ResNet-50 cascade sanity checks | `results/resnet50/` |
+| `notebooks/notebook_vit_cascading.ipynb` | ViT-B/16 cascade sanity checks | `results/vit/` |
+| `notebooks/notebook_mechanistic.ipynb` | Logit correlation & activation scales (ResNet vs ViT) | `results/mechanistic/` |
 | `notebooks/notebook_analysis.ipynb` | Figures only (no model loading) | `results/figures/` |
 
 Legacy TensorFlow replication notebooks live in `notebooks/legacy_tf/`.
 
 ### Shared utilities (`src/`)
 
-- `experiment_utils.py` — full pipelines (data loading, Captum, cascading, mechanistic); used by notebooks and Modal
+- `experiment_utils.py` — full pipelines (data loading, Captum, cascading, occlusion, mechanistic); used by notebooks and Modal
 - `randomize_utils.py` — cascading weight reset (`reset_layer`, checkpoints, layer orders)
 - `metrics_utils.py` — Spearman, SSIM, logit Pearson correlation, map normalization
 - `viz_utils.py` — Adebayo-style cascade figure grids (`qual_bundle.npz` → paper PNGs)
-- `attention_utils.py` — raw attention & rollout (Abnar & Zuidema 2020)
+- `attention_utils.py` — ViT raw attention and entropy validation
 
 ### Running on Modal (cloud GPU)
 
@@ -133,8 +133,10 @@ modal setup
 #   A) Download in cloud: modal run modal/download_imagenet.py --val-tar-url URL --devkit-tar-url URL
 #   B) Upload from laptop: modal volume put saliency-imagenet /path/to/imagenet/val /val
 modal run modal/app.py --experiment resnet50 --num-images 10 --skip-qual   # smoke test
-# Fast 500-image run (7 GPUs per arch in parallel, one per method):
+# Fast 500-image run (one GPU per active method):
 modal run modal/app.py --experiment resnet50 --num-images 500 --skip-qual --parallel-methods
+# Explicit faithfulness axis:
+modal run modal/app.py --experiment occlusion --num-images 500
 ./scripts/download_modal_results.sh
 jupyter notebook notebooks/notebook_analysis.ipynb
 ```
@@ -168,28 +170,22 @@ If you have results from an older commit that randomized deep layers first, dele
 
 ### Expected qualitative behavior (ResNet replication)
 
-ResNet-50 runs **7 methods** (Gradient, SmoothGrad, Input-Grad, GBP, GradCAM, GBP-GC, IG):
+ResNet-50 runs the scoped methods Gradient, Input-Grad, IG, GradCAM, and GBP:
 
-- **Guided Backprop / GBP-GC / Input-Grad**: high SSIM/Spearman when only the classifier / top layers are randomized; Input-Grad often stays near 1.0 (strongest sanity-check failure).
-- **Integrated Gradients / Gradient / SmoothGrad / GradCAM**: similarity drops quickly as more layers are randomized.
+- **Guided Backprop / Input-Grad**: often preserve visual structure when only upper layers are randomized.
+- **Integrated Gradients / Gradient / GradCAM**: expected to respond more directly as relevant pretrained structure is destroyed.
 
 **MNIST** (used in the original paper's Figure 20) is a dataset of 70,000 handwritten digit images (0–9), 28×28 pixels — a classic deep-learning benchmark. The legacy TensorFlow MNIST notebooks live in `notebooks/legacy_tf/`.
 
-### Saliency method sets (cross-architecture)
+### Saliency method sets
 
-| Method | ResNet-50 | ViT / DINOv2 | Notes |
-|--------|-----------|--------------|-------|
-| Gradient, SmoothGrad, Input-Grad, IG, GradCAM | yes | yes | **5 shared methods** — directly comparable across architectures |
-| GBP, GBP-GC | yes | no | ReLU-specific Guided Backprop (ResNet only) |
-| Raw attention, Rollout | no | yes | Transformer attention maps |
+| Class | ResNet-50 | ViT-B/16 | Notes |
+|-------|-----------|----------|-------|
+| A | Gradient, Input-Grad, IG | Gradient, Input-Grad, IG | Portable gradient methods |
+| B | GradCAM | Transformer GradCAM | Architecture-native spatial attribution |
+| C | GBP | Raw attention | Architecture-specific diagnostics |
 
-ViT and DINOv2 runs are **extensions** of the Adebayo cascading test. The analysis notebook includes cross-architecture overlay plots for the 5 shared methods (ResNet vs ViT vs DINOv2), ViT vs DINOv2 attention methods, and mechanistic checks across all three architectures.
-
-### DINOv2 note
-
-`timm` model `vit_base_patch14_dinov2.lvd142m` may ship without a trained ImageNet classifier.
-Before the full 500-image loop, verify `model.num_classes == 1000` and sensible top-1 predictions;
-load an ImageNet linear head checkpoint if needed.
+DINOv2, SmoothGrad, GBP×GradCAM, attention rollout, and DINO attention references are out of active scope. Raw cross-architecture curve overlays are intentionally omitted; cross-architecture summaries use sensitivity ratio only.
 
 ---
 
