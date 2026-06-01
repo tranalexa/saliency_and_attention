@@ -12,7 +12,7 @@ This repository now targets a narrowed saliency sanity-check study:
 | Architecture | Source | Cascade Order | Class B Target |
 |--------------|--------|---------------|----------------|
 | ResNet-50 | `timm.create_model("resnet50", pretrained=True)` | `fc`, then `layer4.2` ... `layer1.0` | GradCAM on `layer4[-1]` |
-| ViT-B/16 | `timm.create_model("vit_base_patch16_224", pretrained=True, img_size=224)` | `head`, then `blocks.11` ... `blocks.0` | Transformer GradCAM on `blocks[-1].norm2`; falls back to `blocks[-2]` if last-block patch gradients are zero |
+| ViT-B/16 | `timm.create_model("vit_base_patch16_224", pretrained=True, img_size=224)` | `head`, then `blocks.11` ... `blocks.0` | Transformer GradCAM on `blocks[-2]` |
 
 DINOv2 is out of scope and is not an active architecture.
 
@@ -25,6 +25,11 @@ DINOv2 is out of scope and is not an active architecture.
 | C | `gbp` | `raw_attn` | Architecture-specific diagnostics |
 
 Removed active methods: `smoothgrad`, `gbp_gc`, `rollout`, and `dino_attn`.
+
+The ViT Transformer GradCAM target was selected empirically with
+`diagnostics/choose_vit_gradcam_layer.py`: final-block candidates were
+degenerate on all sampled images, while `blocks[-2]` was the latest candidate
+with 0% degenerate maps on the pretrained model and tested cascade states.
 
 ## Data
 

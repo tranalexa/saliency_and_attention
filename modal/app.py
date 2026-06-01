@@ -4,6 +4,7 @@ Modal cloud runner for PyTorch sanity-check experiments.
 Usage (from repo root):
   modal run modal/app.py --experiment resnet50 --num-images 500 --skip-qual
   modal run modal/app.py --experiment occlusion --num-images 100
+  modal run modal/app.py --experiment vit_gradcam_diagnostic --num-images 50
   modal run modal/app.py --experiment all --num-images 500 --skip-qual --parallel-methods
   modal run modal/app.py --experiment resnet50 --num-images 10 --sequential
   modal run modal/app.py --experiment resnet50 --qual-only --image-index-mode auto_ssim
@@ -46,6 +47,7 @@ image = (
     .env({"PYTHONPATH": "/root/src"})
     .run_function(_preload_pretrained_weights)
     .add_local_dir(str(REPO_ROOT / "src"), remote_path="/root/src")
+    .add_local_dir(str(REPO_ROOT / "diagnostics"), remote_path="/root/diagnostics")
 )
 
 volume_mounts = {IMAGENET_MOUNT: imagenet_vol, RESULTS_MOUNT: results_vol}
@@ -389,6 +391,42 @@ def run_occlusion(
     results_vol.commit()
 
 
+@app.function(
+    image=image,
+    gpu=GPU_TYPE,
+    timeout=TIMEOUT_SEC,
+    volumes=volume_mounts,
+)
+def run_vit_gradcam_diagnostic(
+    num_images: int = 50,
+    batch_size: int = 8,
+    seed: int = 42,
+):
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [
+            sys.executable,
+            "/root/diagnostics/choose_vit_gradcam_layer.py",
+            "--imagenet-root",
+            IMAGENET_MOUNT,
+            "--num-images",
+            str(num_images),
+            "--batch-size",
+            str(batch_size),
+            "--device",
+            "cuda",
+            "--seed",
+            str(seed),
+            "--output-dir",
+            str(Path(RESULTS_MOUNT) / "diagnostics"),
+        ],
+        check=True,
+    )
+    results_vol.commit()
+
+
 def _launch_arch_parallel(
     arch: str,
     num_images: int,
@@ -486,7 +524,7 @@ def main(
     blur_sigma: float = 8.0,
 ):
     """
-    experiment: resnet50 | vit | mechanistic | occlusion | all
+    experiment: resnet50 | vit | mechanistic | occlusion | vit_gradcam_diagnostic | all
     parallel_methods: one GPU per saliency method (default on)
     sequential: run full pipeline on a single GPU (opt-out of parallel_methods)
     qual_only: only build qual_bundle.npz (no quant recompute)
@@ -560,6 +598,18 @@ def main(
         _wait_handles(handles)
         return
 
+    if experiment == "vit_gradcam_diagnostic":
+        _wait_handles(
+            [
+                run_vit_gradcam_diagnostic.spawn(
+                    num_images=num_images,
+                    batch_size=batch_size,
+                    seed=primary_seed,
+                )
+            ]
+        )
+        return
+
     def launch_arch(name: str) -> list:
         if name == "mechanistic" or not use_parallel_methods:
             bs = 16 if name == "mechanistic" else batch_size
@@ -621,6 +671,10 @@ def main(
         return
 
     if experiment not in experiments:
-        raise ValueError("Unknown experiment: %s (use resnet50|vit|mechanistic|occlusion|all)" % experiment)
+        raise ValueError(
+            "Unknown experiment: %s "
+            "(use resnet50|vit|mechanistic|occlusion|vit_gradcam_diagnostic|all)"
+            % experiment
+        )
 
     _wait_handles(launch_arch(experiment))

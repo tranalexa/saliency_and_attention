@@ -57,7 +57,7 @@ Confirm:
 
 - `randomization_order.json` starts with `fc` for ResNet and `head` for ViT.
 - `experiment_config.json` lists only scoped methods.
-- `gradcam_target` is `layer4[-1]` for ResNet and `blocks[-1].norm2` for ViT; ViT maps may log a fallback to `blocks[-2]` when the requested last-block norm produces zero maps.
+- `gradcam_target` is `layer4[-1]` for ResNet and `blocks[-2]` for ViT. The ViT target is selected by `diagnostics/choose_vit_gradcam_layer.py`, which rejected final-block targets as degenerate.
 - No active result generation writes DINOv2 or removed-method outputs.
 - Occlusion outputs include `{method}_occlusion_curve.npy` and `{method}_occlusion_auc.npy`.
 - Cross-architecture summaries use sensitivity-ratio JSON/table outputs only.

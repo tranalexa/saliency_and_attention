@@ -91,7 +91,7 @@ PRIMARY_SPEARMAN_VARIANT = {
 
 GRADCAM_TARGET_BY_ARCH = {
     "resnet50": "layer4[-1]",
-    "vit": "blocks[-1].norm2",
+    "vit": "blocks[-2]",
 }
 
 MECHANISTIC_ARCH_TAG = {
@@ -546,7 +546,7 @@ def compute_transformer_gradcam(
     """
     GradCAM for ViT using pytorch-grad-cam.
 
-    Target layer: model.blocks[-1].norm2.
+    Target layer: model.blocks[-2].
     Reshape function converts token sequence to spatial feature map.
     """
     from pytorch_grad_cam import GradCAM
@@ -560,22 +560,13 @@ def compute_transformer_gradcam(
     targets = [ClassifierOutputTarget(int(target_class))] * images.shape[0]
     model.eval()
 
-    def run_cam(target_layer: nn.Module) -> np.ndarray:
-        with GradCAM(
-            model=model,
-            target_layers=[target_layer],
-            reshape_transform=reshape_transform,
-        ) as cam:
-            return cam(input_tensor=images, targets=targets)
-
-    target_layer = model.blocks[-1].norm2
-    grayscale_cam = run_cam(target_layer)
-    if np.all(np.std(grayscale_cam.reshape(grayscale_cam.shape[0], -1), axis=1) < 1e-8):
-        logging.warning(
-            "ViT GradCAM on blocks[-1].norm2 produced zero/uniform maps; "
-            "falling back to blocks[-2] so patch tokens have gradient flow."
-        )
-        grayscale_cam = run_cam(model.blocks[-2])
+    target_layer = model.blocks[-2]
+    with GradCAM(
+        model=model,
+        target_layers=[target_layer],
+        reshape_transform=reshape_transform,
+    ) as cam:
+        grayscale_cam = cam(input_tensor=images, targets=targets)
 
     maps = []
     for i in range(grayscale_cam.shape[0]):
