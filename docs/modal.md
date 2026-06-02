@@ -33,7 +33,7 @@ Accepted `--experiment` values:
 - `vit`
 - `mechanistic`
 - `occlusion`
-- `all` (cascade for ResNet/ViT plus mechanistic; occlusion is explicit only)
+- `all` (cascade for ResNet/ViT, mechanistic, and occlusion)
 
 Common commands:
 
@@ -42,13 +42,13 @@ Common commands:
 modal run modal/app.py --experiment resnet50 --num-images 10 --skip-qual --sequential
 modal run modal/app.py --experiment vit --num-images 10 --skip-qual --sequential
 
-# Full cascade axis
-modal run modal/app.py --experiment all --num-images 500 --skip-qual --parallel-methods --seeds 42,1,2
+# Full study: parallel cascade + qual + mechanistic + occlusion (500 images)
+modal run modal/app.py --experiment all --num-images 500 --parallel-methods --target-mode dynamic --seeds 42,1,2
 
-# Mechanistic controls for sensitivity ratio
-modal run modal/app.py --experiment mechanistic --num-images 500
+# Faster quant-only rerun (skip qual figures):
+modal run modal/app.py --experiment all --num-images 500 --skip-qual --parallel-methods --target-mode dynamic
 
-# Blurred-occlusion faithfulness axis
+# Occlusion only (after cascade baseline maps exist)
 modal run modal/app.py --experiment occlusion --num-images 500
 
 # Qualitative cascade grids after cascade outputs exist
@@ -64,9 +64,9 @@ modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim
 | `--experiment` | `resnet50` | `resnet50`, `vit`, `mechanistic`, `occlusion`, or `all` |
 | `--num-images` | `500` | Number of ImageNet validation images |
 | `--batch-size` | `8` | Batch size; mechanistic uses 16 internally |
-| `--skip-qual` | false | Skip qualitative bundle during cascade runs |
+| `--skip-qual` | false | Skip `qual_bundle.npz` (faster; use `--qual-only` afterward) |
 | `--qual-only` | false | Only build `qual_bundle.npz` |
-| `--parallel-methods` | true | Spawn one GPU job per saliency method |
+| `--parallel-methods` | true | Spawn one GPU job per saliency method (default on) |
 | `--sequential` | false | Run one architecture on one GPU |
 | `--force-recompute` | false | Ignore cached outputs |
 | `--target-mode` | `dynamic` | Cascade target policy |
@@ -77,7 +77,8 @@ modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim
 | `--occlusion-arch` | `all` | `resnet50`, `vit`, or `all` for occlusion |
 | `--occlusion-patches` | `30` | Top-K patches to occlude (Binder A.1 default; increase for full-grid) |
 | `--occlusion-patch-size` | `15` | Patch and blur kernel size (15 = Binder main; 8 = appendix robustness) |
-| `--blur-sigma` | `8.0` | Gaussian blur sigma for occlusion |
+| `--blur-type` | `box` | Occlusion blur: `box` (Binder default) or `gaussian` (legacy ablation) |
+| `--blur-sigma` | `8.0` | Gaussian sigma only; ignored when `--blur-type=box` |
 
 ## Results
 

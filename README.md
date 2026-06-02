@@ -133,9 +133,9 @@ modal setup
 #   A) Download in cloud: modal run modal/download_imagenet.py --val-tar-url URL --devkit-tar-url URL
 #   B) Upload from laptop: modal volume put saliency-imagenet /path/to/imagenet/val /val
 modal run modal/app.py --experiment resnet50 --num-images 10 --skip-qual   # smoke test
-# Fast 500-image run (one GPU per active method):
-modal run modal/app.py --experiment resnet50 --num-images 500 --skip-qual --parallel-methods
-# Explicit faithfulness axis:
+# Full study: parallel cascade + qual + mechanistic + occlusion (500 images)
+modal run modal/app.py --experiment all --num-images 500 --parallel-methods --target-mode dynamic --force-recompute
+# Occlusion only (requires cascade baseline maps):
 modal run modal/app.py --experiment occlusion --num-images 500
 ./scripts/download_modal_results.sh
 jupyter notebook notebooks/notebook_analysis.ipynb

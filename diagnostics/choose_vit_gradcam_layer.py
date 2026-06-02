@@ -298,7 +298,7 @@ def main() -> None:
     ).to(args.device).eval()
     order = get_vit_block_names(model)
     original_sd = save_checkpoint(model)
-    images, _targets = load_all_images(loader, model, args.device)
+    images, _targets, _gt_labels = load_all_images(loader, model, args.device)
     states = choose_states(order)
     state_labels = [s.label for s in states]
 

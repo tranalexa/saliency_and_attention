@@ -50,9 +50,9 @@ The default cascade target policy is `dynamic`: explain the current model argmax
 
 ## Blurred-Occlusion Axis
 
-Following Binder et al. (2023) Section A.1, the occlusion axis loads existing baseline maps (does not recompute attributions), ranks non-overlapping 15×15 patches by absolute saliency, and replaces the top 30 highest-scoring patches with a blurred copy of the same normalized input. Gaussian blur uses kernel size 15 (matching patch size) in image space after denormalization.
+Following Binder et al. (2023) Section A.1, the occlusion axis loads existing baseline maps (does not recompute attributions), ranks non-overlapping 15×15 patches by absolute saliency, and replaces the top 30 highest-scoring patches with a blurred copy of the same normalized input. **Box blur** (uniform 15×15 kernel) is the default, applied in `[0, 1]` image space after denormalization. Use `--blur-type gaussian` for the legacy Gaussian ablation.
 
-The target class is fixed at step 0 and is never re-argmaxed during deletion. AUC is the mean softmax confidence over the 30 post-occlusion steps (step 0 excluded). Lower AUC indicates more faithful attribution.
+The target class is fixed at step 0 (model argmax) and is never re-argmaxed during deletion. AUC is the mean softmax confidence over the 30 post-occlusion steps (step 0 excluded). Lower AUC indicates more faithful attribution.
 
 Outputs per method:
 
@@ -61,7 +61,23 @@ Outputs per method:
 - `occlusion_{method}_auc_mean.npy` — scalar mean AUC over all images
 - `occlusion_config.json`
 
+Shared metadata (cascade and occlusion):
+
+- `ground_truth_indices.npy` — ImageNet validation labels
+- `correctly_classified.npy` — boolean mask (`pred_argmax == ground_truth`); optional subset analysis only
+
 For full-grid deletion (opt-in via `--occlusion-patches`), outputs use the `_full` suffix: `occlusion_{method}_curve_full.npy`, `occlusion_{method}_auc_full.npy`.
+
+## Baseline and Target Policies
+
+| Decision | Default | Scope |
+|----------|---------|-------|
+| Cascade `--target-mode` | `dynamic` | Adebayo: explain current model argmax at each randomization depth |
+| Occlusion target | fixed step-0 argmax | Binder: softmax drop for the explained class |
+| IG `--ig-baseline` | `zero` | Integrated Gradients reference input only |
+| Occlusion blur | `box` (kernel = patch size) | Binder Section A.1 |
+
+`frozen_baseline` cascade mode remains available as an ablation (fixed semantic class across depths). Occlusion is unaffected by cascade `target_mode`.
 
 ## Mechanistic Controls
 

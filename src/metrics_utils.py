@@ -223,30 +223,48 @@ def compute_curve_auc(
     return float(np.trapezoid(vals, depths) / width)
 
 
+def compute_d_arch_auc(logit_corr: np.ndarray) -> float:
+    """
+    Compute D_arch as normalized AUC of the logit-correlation curve.
+
+    Negative correlations are treated as noise and clipped to 0. Higher values
+    mean more model-output preservation across the cascade.
+    """
+    corr = np.asarray(logit_corr, dtype=np.float64).ravel()
+    corr = corr[np.isfinite(corr)]
+    if corr.size < 2:
+        return float("nan")
+    corr = np.clip(corr, 0.0, 1.0)
+    x = np.linspace(0.0, 1.0, corr.size)
+    return float(np.trapezoid(corr, x))
+
+
 def compute_sensitivity_ratio(
-    d_half: float,
+    normalized_auc_method: float,
     logit_corr: np.ndarray,
-    fractional_depths: np.ndarray,
-    threshold: float = 0.5,
+    fractional_depths: np.ndarray | None = None,
+    threshold: float | None = None,
 ) -> float:
-    """Ratio of attribution response depth to model-output response depth."""
-    d_arch = _first_crossing_below(logit_corr, fractional_depths, threshold)
-    if not np.isfinite(d_arch):
+    """Compare attribution decay against model-output decay using AUC."""
+    del fractional_depths, threshold
+    normalized_auc_method = float(normalized_auc_method)
+    d_arch_auc = compute_d_arch_auc(logit_corr)
+    if not np.isfinite(normalized_auc_method) or not np.isfinite(d_arch_auc):
         warnings.warn(
-            "logit correlation never crossed threshold %.3f; sensitivity ratio is undefined"
-            % threshold,
+            "normalized attribution AUC or D_arch AUC is undefined; sensitivity ratio is undefined",
             RuntimeWarning,
             stacklevel=2,
         )
         return float("nan")
-    if d_arch == 0.0:
+    denom = 1.0 - d_arch_auc
+    if denom == 0.0:
         warnings.warn(
-            "D_arch is 0.0 at threshold %.3f; returning infinity" % threshold,
+            "D_arch AUC is 1.0; returning infinity",
             RuntimeWarning,
             stacklevel=2,
         )
         return float("inf")
-    return float(d_half / d_arch)
+    return float((1.0 - normalized_auc_method) / denom)
 
 
 def characterize_sensitivity_thresholds(

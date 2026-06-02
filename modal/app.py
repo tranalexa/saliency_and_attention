@@ -46,7 +46,7 @@ image = (
     .pip_install_from_requirements(str(REPO_ROOT / "requirements-pytorch.txt"))
     .env({"PYTHONPATH": "/root/src"})
     .run_function(_preload_pretrained_weights)
-    .add_local_dir(str(REPO_ROOT / "src"), remote_path="/root/src")
+    .add_local_dir(str(REPO_ROOT / "src"), remote_path="/root/src")  # v2
     .add_local_dir(str(REPO_ROOT / "diagnostics"), remote_path="/root/diagnostics")
 )
 
@@ -364,6 +364,7 @@ def run_occlusion(
     ig_steps: int = 50,
     occlusion_patches: int = 30,
     occlusion_patch_size: int = 15,
+    blur_type: str = "box",
     blur_sigma: float = 8.0,
 ):
     import sys
@@ -384,6 +385,7 @@ def run_occlusion(
         ig_steps=ig_steps,
         patch_size=occlusion_patch_size,
         num_patches=occlusion_patches,
+        blur_type=blur_type,
         blur_sigma=blur_sigma,
     )
     results_vol.commit()
@@ -470,6 +472,38 @@ def _wait_handles(handles: list) -> None:
         handle.get()
 
 
+def _launch_occlusion(
+    num_images: int,
+    batch_size: int,
+    force_recompute: bool,
+    primary_seed: int,
+    ig_baseline: str,
+    ig_steps: int,
+    occlusion_arch: str,
+    occlusion_patches: int,
+    occlusion_patch_size: int,
+    blur_type: str,
+    blur_sigma: float,
+) -> list:
+    archs = list(SALIENCY_ARCHS) if occlusion_arch == "all" else [occlusion_arch]
+    return [
+        run_occlusion.spawn(
+            arch=arch,
+            num_images=num_images,
+            batch_size=batch_size,
+            force_recompute=force_recompute,
+            seed=primary_seed,
+            ig_baseline=ig_baseline,
+            ig_steps=ig_steps,
+            occlusion_patches=occlusion_patches,
+            occlusion_patch_size=occlusion_patch_size,
+            blur_type=blur_type,
+            blur_sigma=blur_sigma,
+        )
+        for arch in archs
+    ]
+
+
 def _launch_qual(
     arch: str,
     num_images: int,
@@ -518,6 +552,7 @@ def main(
     occlusion_arch: str = "all",
     occlusion_patches: int = 30,
     occlusion_patch_size: int = 15,
+    blur_type: str = "box",
     blur_sigma: float = 8.0,
 ):
     """
@@ -534,9 +569,13 @@ def main(
     occlusion_arch: resnet50 | vit | all
     occlusion_patches: top-K patches to occlude (30 = Binder A.1; use full grid for extended)
     occlusion_patch_size: patch and blur kernel size (15 = Binder main; 8 = appendix)
+    blur_type: box (Binder default) | gaussian (legacy ablation)
+    blur_sigma: Gaussian sigma only; ignored when blur_type=box
     """
     if ig_baseline not in ("zero", "mean"):
         raise ValueError("ig_baseline must be 'zero' or 'mean'")
+    if blur_type not in ("box", "gaussian"):
+        raise ValueError("blur_type must be 'box' or 'gaussian'")
 
     seed_list = [seed] if seeds == "42" and seed != 42 else _parse_seeds(seeds)
     primary_seed = seed_list[0]
@@ -577,22 +616,19 @@ def main(
         return
 
     if experiment == "occlusion":
-        archs = list(SALIENCY_ARCHS) if occlusion_arch == "all" else [occlusion_arch]
-        handles = [
-            run_occlusion.spawn(
-                arch=arch,
-                num_images=num_images,
-                batch_size=batch_size,
-                force_recompute=force_recompute,
-                seed=primary_seed,
-                ig_baseline=ig_baseline,
-                ig_steps=ig_steps,
-                occlusion_patches=occlusion_patches,
-                occlusion_patch_size=occlusion_patch_size,
-                blur_sigma=blur_sigma,
-            )
-            for arch in archs
-        ]
+        handles = _launch_occlusion(
+            num_images,
+            batch_size,
+            force_recompute,
+            primary_seed,
+            ig_baseline,
+            ig_steps,
+            occlusion_arch,
+            occlusion_patches,
+            occlusion_patch_size,
+            blur_type,
+            blur_sigma,
+        )
         _wait_handles(handles)
         return
 
@@ -662,10 +698,67 @@ def main(
         )
 
     if experiment == "all":
-        all_handles = []
-        for name in ["resnet50", "vit", "mechanistic"]:
-            all_handles.extend(launch_arch(name))
-        _wait_handles(all_handles)
+        if use_parallel_methods:
+            cascade_handles = []
+            for name in SALIENCY_ARCHS:
+                cascade_handles.extend(
+                    _launch_arch_parallel(
+                        name,
+                        num_images,
+                        batch_size,
+                        force_recompute,
+                        target_mode,
+                        seeds=seed_list,
+                        ig_baseline=ig_baseline,
+                        ig_steps=ig_steps,
+                    )
+                )
+            cascade_handles.append(
+                experiments["mechanistic"].spawn(
+                    num_images=num_images,
+                    batch_size=16,
+                    skip_qual=True,
+                    force_recompute=force_recompute,
+                    seed=primary_seed,
+                )
+            )
+            _wait_handles(cascade_handles)
+            if not skip_qual:
+                qual_handles = []
+                for name in SALIENCY_ARCHS:
+                    qual_handles.extend(
+                        _launch_qual(
+                            name,
+                            num_images,
+                            image_index,
+                            image_index_mode,
+                            qual_force,
+                            target_mode=target_mode,
+                            seed=primary_seed,
+                            ig_baseline=ig_baseline,
+                            ig_steps=ig_steps,
+                        )
+                    )
+                _wait_handles(qual_handles)
+        else:
+            all_handles = []
+            for name in ["resnet50", "vit", "mechanistic"]:
+                all_handles.extend(launch_arch(name))
+            _wait_handles(all_handles)
+        occlusion_handles = _launch_occlusion(
+            num_images,
+            batch_size,
+            force_recompute,
+            primary_seed,
+            ig_baseline,
+            ig_steps,
+            occlusion_arch,
+            occlusion_patches,
+            occlusion_patch_size,
+            blur_type,
+            blur_sigma,
+        )
+        _wait_handles(occlusion_handles)
         return
 
     if experiment not in experiments:

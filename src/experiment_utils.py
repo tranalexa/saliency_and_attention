@@ -46,6 +46,7 @@ from randomize_utils import (
 TargetMode = Literal["dynamic", "frozen_baseline"]
 MapNorm = Literal["raw", "abs", "diverging"]
 IgBaseline = Literal["zero", "mean"]
+BlurType = Literal["box", "gaussian"]
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -444,9 +445,12 @@ def check_ig_baseline_completeness(
 
     pass_rate = passed / n_check
     if pass_rate < 0.8:
+        suggested_steps = max(100, n_steps * 2)
         logging.warning(
-            "IG completeness failing on >20%% of images. Increase n_steps from %d to at least 100.",
+            "IG completeness failing on >20%% of images. Consider increasing n_steps "
+            "from %d to at least %d.",
             n_steps,
+            suggested_steps,
         )
     return float(pass_rate)
 
@@ -483,7 +487,13 @@ def compute_input_grad(
         inp = images[i : i + 1]
         tgt = int(target_indices[i].item())
         attr = ixg.attribute(inp, target=tgt)
-        maps.append(attribution_to_map(attr, norm=map_norm))
+        map_1ch = attribution_to_map(attr, norm=map_norm)
+        if map_norm == "raw":
+            assert (map_1ch < 0).any(), (
+                "input_grad map has no negative values. abs() was applied before "
+                "channel aggregation. Check aggregation step."
+            )
+        maps.append(map_1ch)
     return np.stack(maps)
 
 
@@ -607,12 +617,13 @@ def get_target_indices(model: nn.Module, images: torch.Tensor) -> torch.Tensor:
 
 def load_all_images(
     loader: DataLoader, model: nn.Module, device: str
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    all_images, all_targets = [], []
-    for images, _ in tqdm(loader, desc="images"):
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    all_images, all_targets, all_gt_labels = [], [], []
+    for images, gt_labels in tqdm(loader, desc="images"):
         all_images.append(images)
         all_targets.append(get_target_indices(model, images.to(device)).cpu())
-    return torch.cat(all_images), torch.cat(all_targets)
+        all_gt_labels.append(gt_labels)
+    return torch.cat(all_images), torch.cat(all_targets), torch.cat(all_gt_labels)
 
 
 def _method_baseline_path(results_dir: Path, method: str) -> Path:
@@ -697,6 +708,21 @@ def _save_curve_characterization(
     stats["normalized_auc"] = compute_curve_auc(sim_for_ratio, depths_for_ratio)
     if logit_corr is not None:
         logit = np.asarray(logit_corr, dtype=np.float64)
+        if logit.shape != depths.shape:
+            logging.warning(
+                "Skipping sensitivity ratio for %s/%s: logit_corr has shape %s "
+                "but cascade depths have shape %s. Re-run mechanistic after the "
+                "depth-0 cascade fix.",
+                arch,
+                method,
+                logit.shape,
+                depths.shape,
+            )
+            logit_corr = None
+        else:
+            logit_corr = logit
+    if logit_corr is not None:
+        logit = np.asarray(logit_corr, dtype=np.float64)
         logit_depths = depths
         d_arch = characterize_cascade_curve(logit, logit_depths)["d_half"]
         stats["d_arch"] = float(d_arch)
@@ -760,6 +786,30 @@ def compute_baseline_maps(
         )
 
 
+def _map_summary_stats(arr: np.ndarray) -> tuple[float, float, float]:
+    a = np.asarray(arr, dtype=np.float64)
+    return float(np.nanmin(a)), float(np.nanmax(a)), float(np.nanstd(a))
+
+
+def _log_input_grad_ig_stats(results_dir: Path) -> None:
+    try:
+        input_grad = load_baseline_maps(results_dir, "input_grad", norm="raw")[0]
+        ig = load_baseline_maps(results_dir, "ig", norm="raw")[0]
+    except FileNotFoundError:
+        return
+    ixg_stats = _map_summary_stats(input_grad)
+    ig_stats = _map_summary_stats(ig)
+    print(
+        "input_grad stats image0 min/max/std: %.6g %.6g %.6g"
+        % ixg_stats
+    )
+    print("ig stats image0 min/max/std: %.6g %.6g %.6g" % ig_stats)
+    assert not np.allclose(input_grad, ig), (
+        "input_grad and ig maps are identical for image 0. Check method dispatch: "
+        "InputXGradient and IntegratedGradients should run different computations."
+    )
+
+
 def _batch_targets(
     model: nn.Module,
     batch: torch.Tensor,
@@ -771,6 +821,12 @@ def _batch_targets(
     if target_mode == "dynamic":
         return get_target_indices(model, batch.to(device))
     return all_targets[start : start + batch.shape[0]].to(device)
+
+
+def _reset_through_depth(model: nn.Module, order: Sequence[str], depth: int) -> None:
+    """Depth 0 is the pretrained model; depth d randomizes order[:d]."""
+    for name in order[:depth]:
+        reset_layer(model, name)
 
 
 def run_cascading_experiment(
@@ -789,7 +845,7 @@ def run_cascading_experiment(
     force_recompute: bool = False,
 ) -> None:
     original_sd = save_checkpoint(model)
-    num_depths = len(order)
+    num_depths = len(order) + 1
     n_images = all_images.shape[0]
     logit_corr = _load_logit_corr(results_dir, arch)
 
@@ -816,11 +872,10 @@ def run_cascading_experiment(
             if method == "transformer_gradcam"
             else None
         )
-        for depth, _layer_name in enumerate(tqdm(order, desc=method)):
+        for depth in tqdm(range(num_depths), desc=method):
             cascade_context.depth = depth
             restore_checkpoint(model, original_sd)
-            for name in order[: depth + 1]:
-                reset_layer(model, name)
+            _reset_through_depth(model, order, depth)
             rand_maps = []
             method_bs = _method_batch_size(method, batch_size)
             for start in range(0, n_images, method_bs):
@@ -865,6 +920,20 @@ def run_cascading_experiment(
                     else:
                         arrays[metric_key][depth, i] = compute_ssim(base, rand)
 
+            primary_key = (
+                "spearman_rms"
+                if PRIMARY_SPEARMAN_VARIANT.get(method) == "signed_rms"
+                else "spearman_abs_rms"
+            )
+            if depth == 0:
+                depth0_spearman = float(np.nanmean(arrays[primary_key][depth]))
+                assert depth0_spearman > 0.99, (
+                    "Depth-0 Spearman=%.4f for %s. Must be ~1.0. "
+                    "Baseline and cascade maps are being normalized differently "
+                    "or depth 0 is not the pretrained model."
+                    % (depth0_spearman, method)
+                )
+
         for metric_key, arr in arrays.items():
             np.save(results_dir / ("%s_%s.npy" % (method, metric_key)), arr)
             np.save(
@@ -901,18 +970,38 @@ def normalize_images(tensor: torch.Tensor) -> torch.Tensor:
     return (tensor - mean) / std
 
 
+def _box_blur(tensor: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    """Uniform box blur in [0, 1] image space (Binder et al. Section A.1)."""
+    channels = tensor.shape[1]
+    weight = torch.ones(
+        channels,
+        1,
+        kernel_size,
+        kernel_size,
+        device=tensor.device,
+        dtype=tensor.dtype,
+    ) / (kernel_size * kernel_size)
+    return F.conv2d(tensor, weight, padding=kernel_size // 2, groups=channels)
+
+
 def make_blurred_inputs(
     images: torch.Tensor,
     blur_kernel_size: int = 31,
+    blur_type: BlurType = "box",
     blur_sigma: float = 8.0,
 ) -> torch.Tensor:
     """Blur normalized inputs by temporarily returning to image space."""
     denormed = denormalize(images)
-    blurred = transforms.functional.gaussian_blur(
-        denormed,
-        kernel_size=[blur_kernel_size, blur_kernel_size],
-        sigma=[blur_sigma, blur_sigma],
-    )
+    if blur_type == "box":
+        blurred = _box_blur(denormed, blur_kernel_size)
+    elif blur_type == "gaussian":
+        blurred = transforms.functional.gaussian_blur(
+            denormed,
+            kernel_size=[blur_kernel_size, blur_kernel_size],
+            sigma=[blur_sigma, blur_sigma],
+        )
+    else:
+        raise ValueError("Unknown blur_type: %s (use box|gaussian)" % blur_type)
     return normalize_images(blurred)
 
 
@@ -939,10 +1028,28 @@ def _rank_patches_by_saliency(
     saliency_map: np.ndarray,
     patch_slices: Sequence[tuple[slice, slice]],
 ) -> list[tuple[slice, slice]]:
-    intensity = np.abs(np.asarray(saliency_map, dtype=np.float64))
-    scores = [float(intensity[ys, xs].mean()) for ys, xs in patch_slices]
+    saliency = np.asarray(saliency_map, dtype=np.float64)
+    scores = []
+    for ys, xs in patch_slices:
+        patch = saliency[ys, xs]
+        score = np.abs(patch).mean()
+        scores.append(float(score))
     order = np.argsort(scores)[::-1]
     return [patch_slices[int(i)] for i in order]
+
+
+def _patch_score_stats(
+    saliency_map: np.ndarray,
+    patch_slices: Sequence[tuple[slice, slice]],
+) -> tuple[float, float, float]:
+    saliency = np.asarray(saliency_map, dtype=np.float64)
+    scores = []
+    for ys, xs in patch_slices:
+        patch = saliency[ys, xs]
+        score = np.abs(patch).mean()
+        scores.append(float(score))
+    scores = np.array(scores, dtype=np.float64)
+    return float(scores.min()), float(scores.max()), float(scores.std())
 
 
 def _target_probabilities(
@@ -1003,6 +1110,7 @@ def run_blurred_occlusion_faithfulness(
     stride: int | None = None,
     num_patches: int = NUM_PATCHES_BINDER,
     blur_kernel_size: int | None = None,
+    blur_type: BlurType = "box",
     blur_sigma: float = 8.0,
     force_recompute: bool = False,
 ) -> None:
@@ -1021,6 +1129,7 @@ def run_blurred_occlusion_faithfulness(
     blurred_images = make_blurred_inputs(
         all_images.to(device),
         blur_kernel_size=blur_kernel_size,
+        blur_type=blur_type,
         blur_sigma=blur_sigma,
     ).cpu()
 
@@ -1041,6 +1150,28 @@ def run_blurred_occlusion_faithfulness(
         for i in tqdm(range(n_images), desc="occlusion " + method):
             target_class = int(all_targets[i].item())
             ranked = _rank_patches_by_saliency(saliency_maps[i], patch_slices)
+            if i == 0:
+                patch_min, patch_max, patch_std = _patch_score_stats(
+                    saliency_maps[i], patch_slices
+                )
+                original_std = float(denormalize(all_images[i : i + 1]).std().item())
+                blurred_std = float(denormalize(blurred_images[i : i + 1]).std().item())
+                print(
+                    "occlusion %s image0 patch_score min/max/std: %.6g %.6g %.6g"
+                    % (method, patch_min, patch_max, patch_std)
+                )
+                print(
+                    "occlusion %s image0 original_std=%.6g blurred_std=%.6g fixed_target=%d"
+                    % (method, original_std, blurred_std, target_class)
+                )
+                if blurred_std >= original_std:
+                    logging.warning(
+                        "Blurred image std %.6g is not lower than original std %.6g "
+                        "for %s image0.",
+                        blurred_std,
+                        original_std,
+                        method,
+                    )
             _confidences, curve = _blurred_deletion_curve(
                 model,
                 all_images[i],
@@ -1063,23 +1194,22 @@ def run_blurred_occlusion_faithfulness(
                 np.nanmean(aucs),
             )
 
+    occlusion_config = {
+        "patch_size": patch_size,
+        "stride": stride,
+        "num_patches": effective_patches,
+        "blur_kernel_size": blur_kernel_size,
+        "blur_type": blur_type,
+        "target_policy": "fixed_step0_target",
+        "score": "softmax_probability",
+        "curve": "target_probability_steps_1_to_N",
+        "auc": "mean_confidence_steps_1_to_N",
+        "methods": list(methods),
+    }
+    if blur_type == "gaussian":
+        occlusion_config["blur_sigma"] = blur_sigma
     with open(results_dir / "occlusion_config.json", "w") as f:
-        json.dump(
-            {
-                "patch_size": patch_size,
-                "stride": stride,
-                "num_patches": effective_patches,
-                "blur_kernel_size": blur_kernel_size,
-                "blur_sigma": blur_sigma,
-                "target_policy": "fixed_step0_target",
-                "score": "softmax_probability",
-                "curve": "target_probability_steps_1_to_N",
-                "auc": "mean_confidence_steps_1_to_N",
-                "methods": list(methods),
-            },
-            f,
-            indent=2,
-        )
+        json.dump(occlusion_config, f, indent=2)
 
 
 run_occlusion = run_blurred_occlusion_faithfulness
@@ -1139,12 +1269,19 @@ def build_qual_bundle(
     for method in methods_to_compute:
         raw = compute_fn(method, inp, baseline_tgt)[0]
         out["baseline_" + method] = prepare_map_for_metric(raw, "abs_rms")
+        if method == "raw_attn" and cascade_context.grid_size is not None:
+            _raw_attn_map, per_head = get_raw_attention(
+                model,
+                inp,
+                cascade_context.grid_size,
+                return_per_head=True,
+            )
+            out["raw_attn_per_head"] = per_head
         cascade = []
-        for depth in range(len(order)):
+        for depth in range(len(order) + 1):
             cascade_context.depth = depth
             restore_checkpoint(model, original_sd)
-            for name in order[: depth + 1]:
-                reset_layer(model, name)
+            _reset_through_depth(model, order, depth)
             if target_mode == "dynamic":
                 tgt = get_target_indices(model, inp)
             else:
@@ -1319,22 +1456,29 @@ def run_mechanistic(
     original_sd = save_checkpoint(model)
 
     logit_path = results_dir / ("logit_corr_%s.npy" % arch_tag)
+    pretrained_logits_path = results_dir / ("pretrained_logits_%s.npy" % arch_tag)
     if force_recompute or not logit_path.exists():
+        restore_checkpoint(model, original_sd)
         orig_logits = []
         with torch.no_grad():
             for images, _ in tqdm(loader, desc="orig logits " + arch_tag):
                 orig_logits.append(model(images.to(device)).detach().cpu().numpy())
         orig_logits = np.concatenate(orig_logits, axis=0)
+        np.save(pretrained_logits_path, orig_logits)
         logit_corr = []
-        for depth, _ in enumerate(tqdm(order, desc="logit " + arch_tag)):
+        for depth in tqdm(range(len(order) + 1), desc="logit " + arch_tag):
             restore_checkpoint(model, original_sd)
-            for name in order[: depth + 1]:
-                reset_layer(model, name)
+            _reset_through_depth(model, order, depth)
             depth_logits = []
             with torch.no_grad():
                 for images, _ in loader:
                     depth_logits.append(model(images.to(device)).detach().cpu().numpy())
             logit_corr.append(compute_logit_correlation(orig_logits, np.concatenate(depth_logits)))
+        assert logit_corr[0] > 0.5, (
+            "Logit correlation at depth 0 = %.3f. Expected > 0.5. "
+            "Check that pretrained_logits are computed before any randomization occurs."
+            % logit_corr[0]
+        )
         np.save(logit_path, np.array(logit_corr))
 
     for depth in range(len(order)):
@@ -1425,6 +1569,20 @@ def make_saliency_compute_fn(
     return compute_fn
 
 
+def _load_existing_target_mode(results_dir: Path) -> TargetMode:
+    """Preserve cascade target_mode when occlusion updates shared metadata."""
+    config_path = results_dir / "experiment_config.json"
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                existing = json.load(f).get("target_mode")
+            if existing in ("dynamic", "frozen_baseline"):
+                return existing
+        except (json.JSONDecodeError, OSError):
+            pass
+    return "dynamic"
+
+
 def _ensure_shared_metadata(
     results_dir: Path,
     image_indices: List[int],
@@ -1437,9 +1595,17 @@ def _ensure_shared_metadata(
     ig_steps: int = 50,
     ig_baseline: IgBaseline = "zero",
     ig_completeness_pass_rate: float | None = None,
+    gt_labels: torch.Tensor | None = None,
 ) -> None:
     np.save(results_dir / "image_indices.npy", np.array(image_indices))
     np.save(results_dir / "target_indices.npy", all_targets.numpy())
+    if gt_labels is not None:
+        gt = gt_labels.numpy()
+        np.save(results_dir / "ground_truth_indices.npy", gt)
+        np.save(
+            results_dir / "correctly_classified.npy",
+            (all_targets.numpy() == gt),
+        )
     with open(results_dir / "randomization_order.json", "w") as f:
         json.dump(order, f, indent=2)
     resnet_randomization = "block" if arch == "resnet50" else "n/a"
@@ -1514,7 +1680,7 @@ def _run_arch_pipeline(
     if arch == "vit" and "raw_attn" in scored_methods:
         first_img, _ = dataset[0]
         validate_raw_attention(model, first_img[None].to(device), name=arch)
-    all_images, all_targets = load_all_images(loader, model, device)
+    all_images, all_targets, gt_labels = load_all_images(loader, model, device)
     ig_completeness_pass_rate = None
     if "ig" in scored_methods:
         ig_completeness_pass_rate = check_ig_baseline_completeness(
@@ -1537,6 +1703,7 @@ def _run_arch_pipeline(
         ig_steps=ig_steps,
         ig_baseline=ig_baseline,
         ig_completeness_pass_rate=ig_completeness_pass_rate,
+        gt_labels=gt_labels,
     )
     compute_baseline_maps(
         model,
@@ -1549,6 +1716,8 @@ def _run_arch_pipeline(
         device,
         force_recompute=force_recompute,
     )
+    if "input_grad" in scored_methods and "ig" in scored_methods:
+        _log_input_grad_ig_stats(results_dir)
     run_cascading_experiment(
         model,
         order,
@@ -1702,6 +1871,7 @@ def run_occlusion_pipeline(
     stride: int | None = None,
     num_patches: int = NUM_PATCHES_BINDER,
     blur_kernel_size: int | None = None,
+    blur_type: BlurType = "box",
     blur_sigma: float = 8.0,
 ) -> None:
     """Run the blurred-occlusion faithfulness axis for one scoped architecture."""
@@ -1735,18 +1905,19 @@ def run_occlusion_pipeline(
             "Missing baseline npz for: %s. Run cascade first." % missing
         )
 
-    all_images, all_targets = load_all_images(loader, model, device)
+    all_images, all_targets, gt_labels = load_all_images(loader, model, device)
     _ensure_shared_metadata(
         results_dir,
         image_indices,
         all_targets,
         order,
         arch,
-        "frozen_baseline",
+        _load_existing_target_mode(results_dir),
         seed,
         num_images,
         ig_steps=ig_steps,
         ig_baseline=ig_baseline,
+        gt_labels=gt_labels,
     )
     run_blurred_occlusion_faithfulness(
         model,
@@ -1760,6 +1931,7 @@ def run_occlusion_pipeline(
         stride=stride,
         num_patches=num_patches,
         blur_kernel_size=blur_kernel_size,
+        blur_type=blur_type,
         blur_sigma=blur_sigma,
         force_recompute=force_recompute,
     )

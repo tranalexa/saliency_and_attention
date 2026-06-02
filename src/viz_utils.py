@@ -97,9 +97,9 @@ def format_cascade_column_label(
     if arch_family == ARCH_FAMILY_TRANSFORMER:
         m = re.match(r"blocks\.(\d+)$", name)
         if m:
-            return "TF block %s" % m.group(1)
+            return "blocks.%s" % m.group(1)
         if name.startswith("head"):
-            return "TF classifier"
+            return "head"
         if name == "fc":
             return "Classifier"
     if arch_family == ARCH_FAMILY_CNN:
@@ -469,8 +469,11 @@ def plot_cascade_paper_grid(
 
     col_labels = ["Normal\nModel"]
     for d in depth_indices:
-        layer = order[d] if d < len(order) else ""
-        col_labels.append(format_cascade_column_label(layer, arch_family))
+        if d == 0:
+            col_labels.append("Pretrained\n(depth 0)")
+        else:
+            layer = order[d - 1] if d - 1 < len(order) else ""
+            col_labels.append(format_cascade_column_label(layer, arch_family))
 
     nrows = len(methods)
     ncols = 1 + len(depth_indices)
@@ -609,11 +612,12 @@ def plot_cascading_grid(
             heatmap_cmap=heatmap_cmap,
             display_percentile=display_percentile,
         )
-        layer = order[i] if i < len(order) else ""
-        ax.set_title(
-            "Depth %d: %s" % (i, format_cascade_column_label(layer, arch_family)),
-            fontsize=8,
-        )
+        if i == 0:
+            label = "Pretrained (no randomization)"
+        else:
+            layer = order[i - 1] if i - 1 < len(order) else ""
+            label = format_cascade_column_label(layer, arch_family)
+        ax.set_title("Depth %d: %s" % (i, label), fontsize=8)
         ax.axis("off")
     if title:
         fig.suptitle(title)

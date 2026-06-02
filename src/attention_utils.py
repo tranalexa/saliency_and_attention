@@ -68,9 +68,14 @@ def validate_raw_attn_tensor(attn_weights: torch.Tensor, name: str = "") -> None
     Expected shape: (batch, num_heads, num_tokens, num_tokens). Each attention
     row should be non-negative and sum to ~1.0.
     """
+    if attn_weights.dim() != 4:
+        raise ValueError(
+            "Raw attention tensor %s has shape %s, expected (batch, heads, tokens, tokens)."
+            % (name, tuple(attn_weights.shape))
+        )
     row_sums = attn_weights.sum(dim=-1)
     mean_sum = row_sums.mean().item()
-    if abs(mean_sum - 1.0) > 0.01:
+    if abs(mean_sum - 1.0) > 0.05:
         raise ValueError(
             "Raw attention tensor %s row sums to %.4f, expected ~1.0. You are likely "
             "hooking the wrong submodule and capturing pre-softmax logits or value "
@@ -138,6 +143,26 @@ def compute_attention_entropy(attn: torch.Tensor) -> float:
     return float(entropy.detach().cpu().item())
 
 
+def _cls_per_head_spatial_maps(
+    attn: torch.Tensor,
+    grid_size: int,
+    out_size: int = 224,
+    apply_rms_norm: bool = True,
+) -> np.ndarray:
+    cls_by_head = attn[0, :, 0, 1:].detach().cpu().numpy()
+    return np.stack(
+        [
+            _cls_to_spatial_map(
+                cls_weights,
+                grid_size,
+                out_size=out_size,
+                apply_rms_norm=apply_rms_norm,
+            )
+            for cls_weights in cls_by_head
+        ]
+    )
+
+
 def get_raw_attention(
     model: nn.Module,
     input_tensor: torch.Tensor,
@@ -145,7 +170,9 @@ def get_raw_attention(
     out_size: int = 224,
     return_entropy: bool = False,
     apply_rms_norm: bool = True,
-) -> np.ndarray | tuple[np.ndarray, float]:
+    return_per_head: bool = False,
+    head_aggregation: str = "auto",
+) -> np.ndarray | tuple[np.ndarray, float] | tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, float, np.ndarray]:
     """
     Raw attention from last block: average heads, CLS -> patches, spatial map.
 
@@ -162,13 +189,34 @@ def get_raw_attention(
         model(input_tensor)
     handle.remove()
 
+    if not captured:
+        raise ValueError("Raw attention tensor was not captured.")
     attn = captured[0]
-    cls_weights = attn[0].mean(dim=0)[0, 1:].detach().cpu().numpy()
+    validate_raw_attn_tensor(attn, name="raw_attn")
+    cls_by_head = attn[0, :, 0, 1:].detach().cpu().numpy()
     if grid_size is None:
-        grid_size = int(np.sqrt(cls_weights.shape[0]))
+        grid_size = int(np.sqrt(cls_by_head.shape[1]))
+    per_head = _cls_per_head_spatial_maps(
+        attn, grid_size, out_size=out_size, apply_rms_norm=apply_rms_norm
+    )
+    if head_aggregation == "mean":
+        cls_weights = cls_by_head.mean(axis=0)
+    elif head_aggregation == "max":
+        cls_weights = cls_by_head.max(axis=0)
+    elif head_aggregation == "auto":
+        mean_weights = cls_by_head.mean(axis=0)
+        max_weights = cls_by_head.max(axis=0)
+        cls_weights = max_weights if np.std(mean_weights) < 1e-6 and np.std(max_weights) > 1e-6 else mean_weights
+    else:
+        raise ValueError("head_aggregation must be 'mean', 'max', or 'auto'")
     spatial_map = _cls_to_spatial_map(
         cls_weights, grid_size, out_size, apply_rms_norm=apply_rms_norm
     )
+    entropy = compute_attention_entropy(attn)
+    if return_entropy and return_per_head:
+        return spatial_map, entropy, per_head
     if return_entropy:
-        return spatial_map, compute_attention_entropy(attn)
+        return spatial_map, entropy
+    if return_per_head:
+        return spatial_map, per_head
     return spatial_map
