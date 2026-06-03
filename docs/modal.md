@@ -52,7 +52,10 @@ modal run modal/app.py --experiment all --num-images 500 --skip-qual --parallel-
 modal run modal/app.py --experiment occlusion --num-images 500
 
 # Qualitative cascade grids after cascade outputs exist
-modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim
+# Same demo image for ResNet and ViT (shared SSIM pick across both result dirs):
+modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim_shared --qual-force
+# Or fix an index from subset_manifest_first500.json (dataset_index N = same JPEG for both archs):
+modal run modal/app.py --experiment all --qual-only --image-index-mode fixed --image-index 38 --qual-force
 ```
 
 `--experiment occlusion` runs both scoped architectures by default. Use `--occlusion-arch resnet50` or `--occlusion-arch vit` to run one architecture.

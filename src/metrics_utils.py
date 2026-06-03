@@ -11,6 +11,27 @@ from skimage.metrics import structural_similarity
 DEFAULT_RATIO_THRESHOLDS = (0.3, 0.5, 0.7)
 
 
+def visualize_image_grayscale(attr: np.ndarray) -> np.ndarray:
+    """
+    PAIR saliency VisualizeImageGrayscale: clip to non-negative, max over RGB.
+
+    Accepts CHW (3, H, W) or HWC (H, W, 3). Returns HxW in [0, 1] when max > 0.
+    Used for Guided Backprop (do not sum channels — that cancels edge signal).
+    """
+    x = np.asarray(attr, dtype=np.float64)
+    if x.ndim == 3 and x.shape[0] in (1, 3) and x.shape[0] < min(x.shape[1], x.shape[2]):
+        x = np.transpose(x, (1, 2, 0))
+    x = np.clip(x, 0.0, None)
+    if x.ndim == 3:
+        x = np.max(x, axis=-1)
+    if x.ndim != 2:
+        raise ValueError("Expected 2D or 3D attribution, got shape %s" % (attr.shape,))
+    mx = float(x.max())
+    if mx > 0:
+        return x / mx
+    return np.zeros_like(x)
+
+
 def abs_grayscale_norm(img: np.ndarray) -> np.ndarray:
     """Absolute value normalize a 2D array to [0, 1]."""
     assert isinstance(img, np.ndarray)

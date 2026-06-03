@@ -22,6 +22,60 @@ METHOD_DISPLAY_NAMES = {
     "raw_attn": "Raw\nAttention",
 }
 
+# Default: one colormap for every method (fair cross-method comparison).
+CASCADE_MASK_CMAP_UNIFIED = "bwr"
+CASCADE_MASK_CMAP_PAPER = "gray"
+
+# Named presets for notebooks: suffix -> plot_cascade_paper_grid kwargs.
+CASCADE_DISPLAY_PRESETS = {
+    "bwr_pct": {
+        "overlay": False,
+        "mask_cmap": "bwr",
+        "display_norm": "percentile",
+        "colormap_style": "unified",
+    },
+    "jet_pct": {
+        "overlay": False,
+        "mask_cmap": "jet",
+        "display_norm": "percentile",
+        "colormap_style": "unified",
+    },
+    "turbo_pct": {
+        "overlay": False,
+        "mask_cmap": "turbo",
+        "display_norm": "percentile",
+        "colormap_style": "unified",
+    },
+    "hot_pct": {
+        "overlay": False,
+        "mask_cmap": "hot",
+        "display_norm": "percentile",
+        "colormap_style": "unified",
+    },
+    "overlay_jet": {
+        "overlay": True,
+        "heatmap_cmap": "jet",
+        "display_percentile": 99.0,
+    },
+    "bwr_absmax": {
+        "overlay": False,
+        "mask_cmap": "bwr",
+        "display_norm": "absmax",
+        "colormap_style": "unified",
+    },
+}
+
+# Legacy TF notebooks used per-method cmaps (second figure block in cascading ipynb).
+METHOD_CASCADE_CMAP_ADEBAYO_LEGACY = {
+    "gbp": "bwr",
+    "gradient": "bwr",
+    "input_grad": "bwr",
+    "ig": "bwr",
+    "gradcam": "hot",
+    "transformer_gradcam": "hot",
+    "raw_attn": "gray",
+}
+
 
 ARCH_FAMILY_CNN = "cnn"
 ARCH_FAMILY_TRANSFORMER = "transformer"
@@ -292,19 +346,72 @@ def short_layer_label(name: str, max_len: int = 9) -> str:
     return label
 
 
-def prepare_map_for_display(map_2d: np.ndarray) -> np.ndarray:
-    """Min-max stretch to [0, 1] for imshow.
+_FLAT_MAP_STD_THRESH = 1e-4
+_FLAT_MAP_RANGE_THRESH = 0.02
 
-    Unlike abs_grayscale_norm (divides by max, origin at 0), this subtracts the
-    minimum first so the full dynamic range is always visible. This matters for
-    diffuse maps like raw attention from a pretrained ViT where all values cluster
-    near the maximum, making abs-max norm render everything white.
+
+def prepare_map_for_display(
+    map_2d: np.ndarray,
+    *,
+    display_norm: str = "minmax",
+    percentile: float = 99.0,
+    flat_value: float = 0.5,
+) -> np.ndarray:
     """
-    m = np.abs(np.asarray(map_2d, dtype=np.float64))
-    lo, hi = m.min(), m.max()
-    if hi > lo:
-        return (m - lo) / (hi - lo)
-    return np.zeros_like(m)
+    Normalize qual maps for mask panels (display only; does not change stored .npz).
+
+    display_norm:
+      - ``minmax``: stretch |x| to [0, 1] (default; matches pre-33413b2 commit figures).
+      - ``percentile``: clip to p-th percentile then scale to [0, 1] (sparse ViT maps).
+      - ``absmax``: |x| / max(|x|) (strict Adebayo abs-max).
+    Near-uniform maps render as flat_value (avoids saturated raw-attn panels).
+    """
+    m = np.asarray(map_2d, dtype=np.float64)
+    if m.size == 0:
+        return m
+    if display_norm != "minmax":
+        if m.std() < _FLAT_MAP_STD_THRESH and (m.max() - m.min()) < _FLAT_MAP_RANGE_THRESH:
+            return np.full_like(m, flat_value)
+    if display_norm == "minmax":
+        m = np.abs(m)
+        lo, hi = m.min(), m.max()
+        if hi > lo:
+            return (m - lo) / (hi - lo)
+        return np.zeros_like(m)
+    if display_norm == "absmax":
+        return abs_grayscale_norm(m)
+    if display_norm == "percentile":
+        return prepare_heatmap(m, percentile=percentile)
+    raise ValueError(
+        "display_norm must be 'minmax', 'percentile', or 'absmax', got %s" % display_norm
+    )
+
+
+def cascade_colormap_for_method(
+    method: str,
+    colormap_style: str = "unified",
+    mask_cmap: str | None = None,
+) -> str:
+    """
+    Colormap for cascade mask panels (same for all methods unless overridden).
+
+    colormap_style:
+      - ``unified`` (default): ``bwr`` on abs-max masks for every method.
+      - ``paper``: ``gray`` for every method (notebook first-figure style).
+      - ``legacy``: per-method TF demo (bwr/hot/gray mix).
+    mask_cmap: if set, overrides colormap_style for all methods.
+    """
+    if mask_cmap is not None:
+        return mask_cmap
+    if colormap_style == "unified":
+        return CASCADE_MASK_CMAP_UNIFIED
+    if colormap_style == "paper":
+        return CASCADE_MASK_CMAP_PAPER
+    if colormap_style in ("legacy", "adebayo"):
+        return METHOD_CASCADE_CMAP_ADEBAYO_LEGACY.get(method, "gray")
+    raise ValueError(
+        "colormap_style must be 'unified', 'paper', or 'legacy', got %s" % colormap_style
+    )
 
 
 def prepare_heatmap(
@@ -347,7 +454,9 @@ def _show_map_panel(
     show_input_only: bool = False,
     overlay_alpha: float = 0.45,
     heatmap_cmap: str = "jet",
+    mask_cmap: str = "gray",
     display_percentile: float = 99.0,
+    display_norm: str = "minmax",
 ) -> None:
     if show_input_only or (overlay and saliency is None):
         ax.imshow(np.clip(rgb, 0, 1))
@@ -363,10 +472,14 @@ def _show_map_panel(
         )
     else:
         ax.imshow(
-            prepare_map_for_display(saliency),
+            prepare_map_for_display(
+                saliency,
+                display_norm=display_norm,
+                percentile=display_percentile,
+            ),
             vmin=0.0,
             vmax=1.0,
-            cmap="gray",
+            cmap=mask_cmap,
         )
 
 
@@ -394,32 +507,80 @@ def select_depth_indices(n_depths: int, max_cols: Optional[int] = None) -> List[
     return indices
 
 
+def _ssim_metric_paths(results_dir: Path, method: str, seed: int = 42) -> list[Path]:
+    """SSIM curves for Class A may live under ``seed{N}/`` after parallel Modal runs."""
+    names = [method, "ig", "gradient", "input_grad", "gradcam", "transformer_gradcam", "gbp"]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    dirs = [Path(results_dir)]
+    seed_dir = Path(results_dir) / ("seed%d" % seed)
+    if seed_dir not in dirs:
+        dirs.append(seed_dir)
+    paths: list[Path] = []
+    for directory in dirs:
+        for name in ordered:
+            for suffix in ("_ssim_abs_rms.npy", "_ssim.npy"):
+                path = directory / ("%s%s" % (name, suffix))
+                if path.exists():
+                    paths.append(path)
+                    break
+    return paths
+
+
 def pick_qual_image_index(
     results_dir: Path,
     method: str = "ig",
     fallback: int = 0,
+    seed: int | None = None,
 ) -> int:
     """Pick image with largest SSIM drop (baseline vs fully randomized)."""
-    path = Path(results_dir) / ("%s_ssim_abs_rms.npy" % method)
-    if not path.exists():
-        for alt in ("gradient", "input_grad", "gradcam", "transformer_gradcam"):
-            alt_path = Path(results_dir) / ("%s_ssim_abs_rms.npy" % alt)
-            if alt_path.exists():
-                path = alt_path
-                break
-        else:
-            legacy = Path(results_dir) / ("%s_ssim.npy" % method)
-            if legacy.exists():
-                path = legacy
-            else:
-                return fallback
-    ssim = np.load(path)
-    if ssim.ndim != 2 or ssim.shape[1] == 0:
+    if seed is None:
+        seed = experiment_seed(results_dir)
+    paths = _ssim_metric_paths(results_dir, method, seed=seed)
+    best_idx = fallback
+    best_drop = -1.0
+    for path in paths:
+        ssim = np.load(path)
+        if ssim.ndim != 2 or ssim.shape[1] == 0:
+            continue
+        drop = ssim[0] - ssim[-1]
+        if np.all(np.isnan(drop)):
+            continue
+        idx = int(np.nanargmax(drop))
+        drop_val = float(drop[idx])
+        if drop_val > best_drop:
+            best_drop = drop_val
+            best_idx = idx
+    return best_idx if best_drop >= 0 else fallback
+
+
+def pick_qual_image_index_shared(
+    results_dirs: list[Path] | tuple[Path, ...],
+    method: str = "ig",
+    fallback: int = 0,
+) -> int:
+    """Pick one subset index with the largest SSIM drop across archs and methods."""
+    per_image: dict[int, float] = {}
+    for results_dir in results_dirs:
+        seed = experiment_seed(results_dir)
+        for path in _ssim_metric_paths(results_dir, method, seed=seed):
+            ssim = np.load(path)
+            if ssim.ndim != 2 or ssim.shape[1] == 0:
+                continue
+            drop = ssim[0] - ssim[-1]
+            for i, value in enumerate(drop):
+                if np.isnan(value):
+                    continue
+                v = float(value)
+                if v > per_image.get(i, -1.0):
+                    per_image[i] = v
+    if not per_image:
         return fallback
-    drop = ssim[0] - ssim[-1]
-    if np.all(np.isnan(drop)):
-        return fallback
-    return int(np.nanargmax(drop))
+    return max(per_image, key=per_image.get)
 
 
 def _method_display(method: str) -> str:
@@ -438,6 +599,9 @@ def plot_cascade_paper_grid(
     heatmap_cmap: str = "jet",
     display_percentile: float = 99.0,
     max_depth_cols: Optional[int] = None,
+    colormap_style: str = "unified",
+    mask_cmap: str | None = None,
+    display_norm: str = "minmax",
     dpi: int = 150,
     show: bool = False,
 ) -> Optional[plt.Figure]:
@@ -447,8 +611,8 @@ def plot_cascade_paper_grid(
     max_depth_cols=None shows every randomization step (e.g. all 17 for ResNet-50).
     Set max_depth_cols=8 to subsample for a compact figure.
 
-    overlay=True blends a jet-style heatmap on the stored input image (paper bird figure).
-    overlay=False shows grayscale masks on black only.
+    Default overlay=True (jet on input image), matching commit 33413b2 primary figures.
+    overlay=False uses gray mask panels with display_norm='minmax' unless overridden.
     """
     qual_path = Path(qual_path)
     if not qual_path.exists():
@@ -510,6 +674,9 @@ def plot_cascade_paper_grid(
             transform=ax_label.transAxes,
         )
         cascade = data["cascade_" + method]
+        row_cmap = cascade_colormap_for_method(
+            method, colormap_style=colormap_style, mask_cmap=mask_cmap
+        )
         for j in range(ncols):
             ax = fig.add_subplot(gs[i, j + 1])
             if j == 0:
@@ -521,7 +688,9 @@ def plot_cascade_paper_grid(
                     overlay=overlay,
                     overlay_alpha=overlay_alpha,
                     heatmap_cmap=heatmap_cmap,
+                    mask_cmap=row_cmap,
                     display_percentile=display_percentile,
+                    display_norm=display_norm,
                 )
             else:
                 d = depth_indices[j - 1]
@@ -532,7 +701,9 @@ def plot_cascade_paper_grid(
                     overlay=overlay,
                     overlay_alpha=overlay_alpha,
                     heatmap_cmap=heatmap_cmap,
+                    mask_cmap=row_cmap,
                     display_percentile=display_percentile,
+                    display_norm=display_norm,
                 )
             ax.set_xticks([])
             ax.set_yticks([])
@@ -568,6 +739,9 @@ def plot_cascading_grid(
     overlay_alpha: float = 0.45,
     heatmap_cmap: str = "jet",
     display_percentile: float = 99.0,
+    colormap_style: str = "unified",
+    mask_cmap: str | None = None,
+    display_norm: str = "minmax",
     dpi: int = 150,
     show: bool = False,
 ) -> Optional[plt.Figure]:
@@ -583,6 +757,9 @@ def plot_cascading_grid(
     order = list(data["order"])
     arch_family = resolve_arch_family(arch, order)
     rgb = np.clip(np.asarray(data["image"], dtype=np.float64), 0.0, 1.0)
+    row_cmap = cascade_colormap_for_method(
+        method, colormap_style=colormap_style, mask_cmap=mask_cmap
+    )
     nrows = len(cascade) + 2
     fig = plt.figure(figsize=(4, 0.4 * nrows))
     gs = gridspec.GridSpec(nrows, 1)
@@ -598,7 +775,9 @@ def plot_cascading_grid(
         overlay=overlay,
         overlay_alpha=overlay_alpha,
         heatmap_cmap=heatmap_cmap,
+        mask_cmap=row_cmap,
         display_percentile=display_percentile,
+        display_norm=display_norm,
     )
     ax.set_title("Baseline (no randomization)")
     ax.axis("off")
@@ -611,7 +790,9 @@ def plot_cascading_grid(
             overlay=overlay,
             overlay_alpha=overlay_alpha,
             heatmap_cmap=heatmap_cmap,
+            mask_cmap=row_cmap,
             display_percentile=display_percentile,
+            display_norm=display_norm,
         )
         if i == 0:
             label = "Pretrained (no randomization)"

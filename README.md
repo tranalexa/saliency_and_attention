@@ -154,7 +154,7 @@ modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim
 jupyter notebook notebooks/notebook_analysis.ipynb
 ```
 
-Outputs: `results/figures/cascade_grid_<arch>.png` (jet heatmap overlaid on the input image, Adebayo bird-demo style) and `cascade_grid_<arch>_masks.png` (grayscale masks only). Legacy TF layout is in `notebooks/legacy_tf/inceptionv3_cascading_randomization.ipynb`.
+Outputs: `cascade_grid_<arch>.png` (primary: jet overlay on input, same as commit 33413b2), `cascade_grid_<arch>_masks.png` (gray masks). Optional extras: `_bwr_pct`, `_jet_pct`, `_turbo_pct`, etc. Rebuild `qual_bundle.npz` with `--qual-force` after pipeline changes.
 
 ### Dataset
 

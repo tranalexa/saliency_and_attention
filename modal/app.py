@@ -560,7 +560,8 @@ def main(
     parallel_methods: one GPU per saliency method (default on)
     sequential: run full pipeline on a single GPU (opt-out of parallel_methods)
     qual_only: only build qual_bundle.npz (no quant recompute)
-    image_index_mode: fixed | auto_ssim (pick demo image from existing SSIM arrays)
+    image_index_mode: fixed | auto_ssim | auto_ssim_shared
+      (auto_ssim uses one index per arch; shared / all+auto_ssim picks the same index for every arch)
     force_recompute: ignore cached spearman/baseline npy (full rerun)
     target_mode: dynamic (per-depth argmax) | frozen_baseline
     seeds: comma-separated RNG seeds; Class A methods run for each seed in seed subdirs

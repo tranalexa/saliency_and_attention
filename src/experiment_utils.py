@@ -23,6 +23,7 @@ from attention_utils import (
 )
 from metrics_utils import (
     abs_grayscale_norm,
+    visualize_image_grayscale,
     characterize_cascade_curve,
     characterize_sensitivity_thresholds,
     compute_curve_auc,
@@ -34,7 +35,7 @@ from metrics_utils import (
     diverging_norm,
     prepare_map_for_metric,
 )
-from viz_utils import pick_qual_image_index
+from viz_utils import pick_qual_image_index, pick_qual_image_index_shared
 from randomize_utils import (
     get_resnet_block_names,
     get_vit_block_names,
@@ -398,6 +399,30 @@ def attribution_to_map(
     return diverging_norm(out)
 
 
+def gbp_attribution_to_map(
+    attr: torch.Tensor,
+    out_size: int = 224,
+    norm: MapNorm = "raw",
+) -> np.ndarray:
+    """GBP: PAIR VisualizeImageGrayscale (positive max over channels), then optional norm."""
+    arr = attr.squeeze().detach().cpu().numpy()
+    if arr.ndim == 4:
+        arr = arr[0]
+    out = visualize_image_grayscale(arr)
+    if out.shape != (out_size, out_size):
+        t = torch.from_numpy(out.astype(np.float64)).float()[None, None]
+        out = (
+            F.interpolate(t, size=(out_size, out_size), mode="bilinear", align_corners=False)
+            .squeeze()
+            .numpy()
+        )
+    if norm == "raw":
+        return out.astype(np.float64)
+    if norm == "abs":
+        return abs_grayscale_norm(out)
+    return diverging_norm(out)
+
+
 def compute_ig(
     model: nn.Module,
     images: torch.Tensor,
@@ -584,7 +609,7 @@ def compute_gbp(
         inp = images[i : i + 1]
         tgt = int(target_indices[i].item())
         attr = gbp.attribute(inp, target=tgt)
-        maps.append(attribution_to_map(attr, norm=map_norm))
+        maps.append(gbp_attribution_to_map(attr, norm=map_norm))
     return np.stack(maps)
 
 
@@ -1376,16 +1401,23 @@ def build_qual_bundle(
             "image_index": np.int64(image_index),
             "target_index": np.int64(int(baseline_tgt[0].item())),
             "target_mode": np.array(target_mode),
+            "qual_norm": np.array("abs_maxabs"),
         }
     )
     for method in methods_to_compute:
-        raw = compute_fn(method, inp.clone(), baseline_tgt)[0]
-        out["baseline_" + method] = prepare_map_for_metric(raw, "abs_rms")
+        restore_checkpoint(model, original_sd)
+        _reset_through_depth(model, order, 0)
+        attr_inp = inp.clone()
+        if target_mode == "dynamic":
+            tgt = get_target_indices(model, attr_inp)
+        else:
+            tgt = baseline_tgt
+        raw = compute_fn(method, attr_inp, tgt)[0]
+        out["baseline_" + method] = prepare_map_for_metric(raw, "abs_maxabs")
         if method == "raw_attn" and cascade_context.grid_size is not None:
-            attn_inp = inp.clone()
             _raw_attn_map, per_head = get_raw_attention(
                 model,
-                attn_inp,
+                attr_inp,
                 cascade_context.grid_size,
                 return_per_head=True,
             )
@@ -1402,7 +1434,7 @@ def build_qual_bundle(
                 tgt = baseline_tgt
             cascade.append(
                 prepare_map_for_metric(
-                    compute_fn(method, attr_inp, tgt)[0], "abs_rms"
+                    compute_fn(method, attr_inp, tgt)[0], "abs_maxabs"
                 )
             )
         out["cascade_" + method] = np.stack(cascade)
@@ -1502,12 +1534,25 @@ def run_qual_bundle_pipeline(
     validate_imagenet_root(imagenet_root)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    if image_index_mode == "auto_ssim":
-        image_index = pick_qual_image_index(
-            results_dir, method=auto_ssim_method, fallback=image_index
-        )
+    if image_index_mode in ("auto_ssim", "auto_ssim_shared"):
+        peer_dirs = [
+            results_dir.parent / name
+            for name in ARCH_SALIENCY_METHODS
+            if (results_dir.parent / name).is_dir()
+        ]
+        use_shared = image_index_mode == "auto_ssim_shared" or len(peer_dirs) > 1
+        if use_shared and len(peer_dirs) > 1:
+            image_index = pick_qual_image_index_shared(
+                peer_dirs, method=auto_ssim_method, fallback=image_index
+            )
+        else:
+            image_index = pick_qual_image_index(
+                results_dir, method=auto_ssim_method, fallback=image_index
+            )
     elif image_index_mode != "fixed":
-        raise ValueError("image_index_mode must be 'fixed' or 'auto_ssim'")
+        raise ValueError(
+            "image_index_mode must be 'fixed', 'auto_ssim', or 'auto_ssim_shared'"
+        )
 
     model, order, dataset, compute_fn, methods, cascade_context = _setup_arch_model(
         arch,
