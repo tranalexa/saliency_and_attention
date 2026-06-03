@@ -32,6 +32,8 @@ Cascading model randomization and blurred-occlusion faithfulness on ResNet-50 an
 5. Keep the step-0 target class (model argmax) fixed throughout deletion.
 6. AUC = mean softmax confidence over steps 1–30 (step 0 excluded). Lower AUC = more faithful.
 
+**Tensor separation:** Occlusion progressively replaces patches only inside `_blurred_deletion_curve` working copies. Cascade baseline maps, cascade metrics, and `qual_bundle.npz` attributions always run on clean cloned inputs via `_attribution_batch`. Do not run occlusion in the same process before recomputing baseline/qual unless images are reloaded from disk.
+
 Outputs: `occlusion_{method}_curve.npy` `(N, 30)`, `occlusion_{method}_auc.npy`, `occlusion_{method}_auc_mean.npy`, plus `ground_truth_indices.npy` and `correctly_classified.npy` from cascade runs.
 
 ## Modal Rerun

@@ -47,6 +47,7 @@ TargetMode = Literal["dynamic", "frozen_baseline"]
 MapNorm = Literal["raw", "abs", "diverging"]
 IgBaseline = Literal["zero", "mean"]
 BlurType = Literal["box", "gaussian"]
+SubsetOrder = Literal["imagefolder", "sorted"]
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -226,17 +227,69 @@ class ILSVRCValDataset(Dataset):
         return image, self.wnid_to_idx[wnid]
 
 
+def _sorted_val_image_paths(val_dir: Path) -> list[Path]:
+    """All val JPEGs sorted by filename (standard ILSVRC val tar order)."""
+    paths = list(val_dir.rglob("*.JPEG")) + list(val_dir.rglob("*.jpg"))
+    return sorted(paths, key=lambda p: p.name)
+
+
+class SortedValDataset(Dataset):
+    """ILSVRC val images in sorted JPEG filename order."""
+
+    def __init__(
+        self,
+        val_dir: str | Path,
+        transform=None,
+        root_for_meta: str | Path | None = None,
+    ):
+        from PIL import Image
+
+        val_dir = Path(val_dir)
+        root_for_meta = Path(root_for_meta or val_dir.parent)
+        self.wnid_to_idx = ilsvrc_wnid_to_index(root_for_meta)
+        self.transform = transform
+        self.loader = Image.open
+        self.paths = _sorted_val_image_paths(val_dir)
+        if not self.paths:
+            raise FileNotFoundError("No val JPEGs found under %s" % val_dir)
+        missing = {p.parent.name for p in self.paths} - set(self.wnid_to_idx)
+        if missing:
+            raise ValueError(
+                "Unknown WNIDs in val (first few): %s" % sorted(missing)[:5]
+            )
+        self.labels = [self.wnid_to_idx[p.parent.name] for p in self.paths]
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int):
+        image = self.loader(self.paths[index]).convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, self.labels[index]
+
+
 def load_imagenet_subset(
     root: str | Path,
     num_images: int = 500,
     split: str = "val",
     image_size: int = 224,
     transform=None,
+    subset_order: SubsetOrder = "sorted",
 ) -> Tuple[Subset, List[int]]:
+    """
+    Load the first ``num_images`` of ImageNet validation.
+
+    ``sorted`` (default): ``ILSVRC2012_val_*.JPEG`` paths under ``val/`` sorted by filename.
+
+    ``imagefolder``: PyTorch ImageFolder order (alphabetical WNID folders).
+    """
     transform = transform or build_transform(image_size)
     root = Path(root)
     val_dir = root / split
-    if val_dir.exists():
+    if val_dir.exists() and subset_order == "sorted":
+        dataset = SortedValDataset(val_dir, transform=transform, root_for_meta=root)
+    elif val_dir.exists():
         try:
             dataset = datasets.ImageNet(root=str(root), split=split, transform=transform)
         except Exception:
@@ -274,6 +327,26 @@ def _clear_cuda() -> None:
 def _method_batch_size(method: str, batch_size: int) -> int:
     cap = METHOD_BATCH_CAPS.get(method, batch_size)
     return max(1, min(batch_size, cap))
+
+
+def _attribution_batch(images: torch.Tensor, device: str) -> torch.Tensor:
+    """Copy inputs before saliency attribution (never reuse occlusion working tensors)."""
+    return images.clone().to(device)
+
+
+def _apply_patch_replacement(
+    current: torch.Tensor,
+    blurred: torch.Tensor,
+    ys: slice,
+    xs: slice,
+) -> None:
+    """Replace one spatial patch; supports (C,H,W) or (1,C,H,W)."""
+    if current.dim() == 4:
+        current[:, :, ys, xs] = blurred[:, :, ys, xs]
+    elif current.dim() == 3:
+        current[:, ys, xs] = blurred[:, ys, xs]
+    else:
+        raise ValueError("Expected 3D or 4D image tensor, got shape %s" % (current.shape,))
 
 
 def attribution_to_map(
@@ -630,19 +703,36 @@ def _method_baseline_path(results_dir: Path, method: str) -> Path:
     return results_dir / ("baseline_%s.npz" % method)
 
 
-def _method_baseline_exists(results_dir: Path, method: str) -> bool:
-    path = _method_baseline_path(results_dir, method)
-    if not path.exists():
-        legacy = results_dir / "baseline_maps.npz"
-        if legacy.exists():
-            return ("baseline_" + method) in np.load(legacy).files
-        return False
-    data = np.load(path)
-    return "baseline_map_raw" in data.files or "baseline_map" in data.files
+def _baseline_search_dirs(
+    results_dir: Path, method: str, seed: int = 42
+) -> list[Path]:
+    """Class A baselines from parallel Modal jobs live under ``arch/seed{N}/``."""
+    dirs = [results_dir]
+    if method in METHODS_CLASS_A:
+        seed_dir = results_dir / ("seed%d" % seed)
+        if seed_dir not in dirs:
+            dirs.append(seed_dir)
+    return dirs
+
+
+def _method_baseline_exists(
+    results_dir: Path, method: str, seed: int = 42
+) -> bool:
+    for directory in _baseline_search_dirs(results_dir, method, seed):
+        path = _method_baseline_path(directory, method)
+        if not path.exists():
+            legacy = directory / "baseline_maps.npz"
+            if legacy.exists() and ("baseline_" + method) in np.load(legacy).files:
+                return True
+            continue
+        data = np.load(path)
+        if "baseline_map_raw" in data.files or "baseline_map" in data.files:
+            return True
+    return False
 
 
 def load_baseline_maps(
-    results_dir: Path, method: str, norm: MapNorm = "raw"
+    results_dir: Path, method: str, norm: MapNorm = "raw", seed: int = 42
 ) -> np.ndarray:
     if norm == "raw":
         key = "baseline_map_raw"
@@ -650,22 +740,23 @@ def load_baseline_maps(
         key = "baseline_map"
     else:
         key = "baseline_map_div"
-    per_method = _method_baseline_path(results_dir, method)
-    if per_method.exists():
-        data = np.load(per_method)
-        if key in data.files:
-            return data[key]
-        if norm == "raw" and "baseline_map" in data.files:
-            return data["baseline_map"]
-    legacy = results_dir / "baseline_maps.npz"
-    if legacy.exists():
-        data = np.load(legacy)
-        legacy_key = "baseline_" + method
-        if legacy_key in data.files:
-            return data[legacy_key]
+    for directory in _baseline_search_dirs(results_dir, method, seed):
+        per_method = _method_baseline_path(directory, method)
+        if per_method.exists():
+            data = np.load(per_method)
+            if key in data.files:
+                return data[key]
+            if norm == "raw" and "baseline_map" in data.files:
+                return data["baseline_map"]
+        legacy = directory / "baseline_maps.npz"
+        if legacy.exists():
+            data = np.load(legacy)
+            legacy_key = "baseline_" + method
+            if legacy_key in data.files:
+                return data[legacy_key]
     raise FileNotFoundError(
-        "Baseline maps for method %r (norm=%s) not found under %s"
-        % (method, norm, results_dir)
+        "Baseline maps for method %r (norm=%s) not found under %s (seed=%d)"
+        % (method, norm, results_dir, seed)
     )
 
 
@@ -769,7 +860,9 @@ def compute_baseline_maps(
         batch_maps = []
         method_bs = _method_batch_size(method, batch_size)
         for start in range(0, len(all_images), method_bs):
-            batch = all_images[start : start + method_bs].to(device)
+            batch = _attribution_batch(
+                all_images[start : start + method_bs], device
+            )
             tgt = all_targets[start : start + method_bs].to(device)
             batch_maps.append(compute_fn(method, batch, tgt))
             _clear_cuda()
@@ -879,7 +972,9 @@ def run_cascading_experiment(
             rand_maps = []
             method_bs = _method_batch_size(method, batch_size)
             for start in range(0, n_images, method_bs):
-                batch = all_images[start : start + method_bs].to(device)
+                batch = _attribution_batch(
+                    all_images[start : start + method_bs], device
+                )
                 tgt = _batch_targets(model, batch, all_targets, start, target_mode, device)
                 rand_maps.append(compute_fn(method, batch, tgt))
                 _clear_cuda()
@@ -895,7 +990,9 @@ def run_cascading_experiment(
             if method == "raw_attn":
                 entropy_vals = []
                 for start in range(0, n_images, method_bs):
-                    batch = all_images[start : start + method_bs].to(device)
+                    batch = _attribution_batch(
+                        all_images[start : start + method_bs], device
+                    )
                     for i in range(batch.shape[0]):
                         _map, entropy = get_raw_attention(
                             model,
@@ -1074,7 +1171,12 @@ def _blurred_deletion_curve(
     device: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (confidences, curve) where confidences[0] is unoccluded and curve excludes step 0."""
-    current = image.detach().clone()
+    image = image.detach().clone()
+    blurred = blurred.detach().clone()
+    if image.dim() == 3:
+        image = image.unsqueeze(0)
+        blurred = blurred.unsqueeze(0)
+    current = image.clone()
     pending = [current.clone()]
     scores: list[np.ndarray] = []
 
@@ -1085,7 +1187,7 @@ def _blurred_deletion_curve(
             pending.clear()
 
     for ys, xs in ranked_patches[:num_patches]:
-        current[:, ys, xs] = blurred[:, ys, xs]
+        _apply_patch_replacement(current, blurred, ys, xs)
         pending.append(current.clone())
         if len(pending) >= eval_batch_size:
             flush()
@@ -1113,6 +1215,7 @@ def run_blurred_occlusion_faithfulness(
     blur_type: BlurType = "box",
     blur_sigma: float = 8.0,
     force_recompute: bool = False,
+    seed: int = 42,
 ) -> None:
     """Run fixed-target blurred-patch deletion (Binder et al. Section A.1)."""
     if stride is None:
@@ -1121,13 +1224,15 @@ def run_blurred_occlusion_faithfulness(
         blur_kernel_size = patch_size
 
     results_dir.mkdir(parents=True, exist_ok=True)
-    n_images, _channels, height, width = all_images.shape
+    images_snapshot = all_images.clone()
+    clean_images = all_images.clone()
+    n_images, _channels, height, width = clean_images.shape
     patch_slices = _patch_slices(height, width, patch_size, stride)
     n_grid = len(patch_slices)
     effective_patches = min(num_patches, n_grid)
     output_suffix = _occlusion_output_suffix(effective_patches, n_grid)
     blurred_images = make_blurred_inputs(
-        all_images.to(device),
+        clean_images.to(device),
         blur_kernel_size=blur_kernel_size,
         blur_type=blur_type,
         blur_sigma=blur_sigma,
@@ -1142,7 +1247,9 @@ def run_blurred_occlusion_faithfulness(
             print("Skip occlusion", method)
             continue
 
-        saliency_maps = load_baseline_maps(results_dir, method, norm="raw")
+        saliency_maps = load_baseline_maps(
+            results_dir, method, norm="raw", seed=seed
+        )
         curves = np.full((n_images, effective_patches), np.nan, dtype=np.float64)
         aucs = np.full(n_images, np.nan, dtype=np.float64)
         method_bs = _method_batch_size(method, batch_size)
@@ -1154,7 +1261,7 @@ def run_blurred_occlusion_faithfulness(
                 patch_min, patch_max, patch_std = _patch_score_stats(
                     saliency_maps[i], patch_slices
                 )
-                original_std = float(denormalize(all_images[i : i + 1]).std().item())
+                original_std = float(denormalize(clean_images[i : i + 1]).std().item())
                 blurred_std = float(denormalize(blurred_images[i : i + 1]).std().item())
                 print(
                     "occlusion %s image0 patch_score min/max/std: %.6g %.6g %.6g"
@@ -1174,8 +1281,8 @@ def run_blurred_occlusion_faithfulness(
                     )
             _confidences, curve = _blurred_deletion_curve(
                 model,
-                all_images[i],
-                blurred_images[i],
+                clean_images[i].clone(),
+                blurred_images[i].clone(),
                 target_class,
                 ranked,
                 effective_patches,
@@ -1185,6 +1292,11 @@ def run_blurred_occlusion_faithfulness(
             curves[i] = curve
             aucs[i] = float(np.mean(curve))
             _clear_cuda()
+
+        if not torch.equal(all_images, images_snapshot):
+            raise RuntimeError(
+                "Occlusion modified the input batch; attribution tensors must stay clean."
+            )
 
         np.save(curve_path, curves)
         np.save(auc_path, aucs)
@@ -1267,12 +1379,13 @@ def build_qual_bundle(
         }
     )
     for method in methods_to_compute:
-        raw = compute_fn(method, inp, baseline_tgt)[0]
+        raw = compute_fn(method, inp.clone(), baseline_tgt)[0]
         out["baseline_" + method] = prepare_map_for_metric(raw, "abs_rms")
         if method == "raw_attn" and cascade_context.grid_size is not None:
+            attn_inp = inp.clone()
             _raw_attn_map, per_head = get_raw_attention(
                 model,
-                inp,
+                attn_inp,
                 cascade_context.grid_size,
                 return_per_head=True,
             )
@@ -1282,11 +1395,16 @@ def build_qual_bundle(
             cascade_context.depth = depth
             restore_checkpoint(model, original_sd)
             _reset_through_depth(model, order, depth)
+            attr_inp = inp.clone()
             if target_mode == "dynamic":
-                tgt = get_target_indices(model, inp)
+                tgt = get_target_indices(model, attr_inp)
             else:
                 tgt = baseline_tgt
-            cascade.append(prepare_map_for_metric(compute_fn(method, inp, tgt)[0], "abs_rms"))
+            cascade.append(
+                prepare_map_for_metric(
+                    compute_fn(method, attr_inp, tgt)[0], "abs_rms"
+                )
+            )
         out["cascade_" + method] = np.stack(cascade)
     np.savez_compressed(qual_path, **out)
 
@@ -1596,6 +1714,7 @@ def _ensure_shared_metadata(
     ig_baseline: IgBaseline = "zero",
     ig_completeness_pass_rate: float | None = None,
     gt_labels: torch.Tensor | None = None,
+    subset_order: SubsetOrder = "sorted",
 ) -> None:
     np.save(results_dir / "image_indices.npy", np.array(image_indices))
     np.save(results_dir / "target_indices.npy", all_targets.numpy())
@@ -1637,6 +1756,7 @@ def _ensure_shared_metadata(
         seed=seed,
         num_images=num_images,
         randomization_order=order,
+        subset_order=subset_order,
     )
 
 
@@ -1655,6 +1775,7 @@ def _run_arch_pipeline(
     force_recompute: bool = False,
     seed: int = 42,
     ig_baseline: IgBaseline = "zero",
+    subset_order: SubsetOrder = "sorted",
 ) -> None:
     set_seed(seed)
     validate_imagenet_root(imagenet_root)
@@ -1665,6 +1786,7 @@ def _run_arch_pipeline(
         num_images,
         image_size=image_size,
         transform=build_transform(image_size),
+        subset_order=subset_order,
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
@@ -1704,6 +1826,7 @@ def _run_arch_pipeline(
         ig_baseline=ig_baseline,
         ig_completeness_pass_rate=ig_completeness_pass_rate,
         gt_labels=gt_labels,
+        subset_order=subset_order,
     )
     compute_baseline_maps(
         model,
@@ -1873,6 +1996,7 @@ def run_occlusion_pipeline(
     blur_kernel_size: int | None = None,
     blur_type: BlurType = "box",
     blur_sigma: float = 8.0,
+    subset_order: SubsetOrder = "sorted",
 ) -> None:
     """Run the blurred-occlusion faithfulness axis for one scoped architecture."""
     if arch not in ARCH_SALIENCY_METHODS:
@@ -1886,6 +2010,7 @@ def run_occlusion_pipeline(
         num_images,
         image_size=image_size,
         transform=build_transform(image_size),
+        subset_order=subset_order,
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
     model, order, _cascade_context, _compute_fn, methods, _grid = _build_arch_runtime(
@@ -1899,7 +2024,9 @@ def run_occlusion_pipeline(
         first_img, _ = dataset[0]
         validate_raw_attention(model, first_img[None].to(device), name=arch)
 
-    missing = [m for m in methods if not _method_baseline_exists(results_dir, m)]
+    missing = [
+        m for m in methods if not _method_baseline_exists(results_dir, m, seed=seed)
+    ]
     if missing:
         raise FileNotFoundError(
             "Missing baseline npz for: %s. Run cascade first." % missing
@@ -1918,6 +2045,7 @@ def run_occlusion_pipeline(
         ig_steps=ig_steps,
         ig_baseline=ig_baseline,
         gt_labels=gt_labels,
+        subset_order=subset_order,
     )
     run_blurred_occlusion_faithfulness(
         model,
@@ -1934,6 +2062,7 @@ def run_occlusion_pipeline(
         blur_type=blur_type,
         blur_sigma=blur_sigma,
         force_recompute=force_recompute,
+        seed=seed,
     )
 
 

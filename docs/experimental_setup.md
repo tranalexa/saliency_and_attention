@@ -42,6 +42,8 @@ std = (0.229, 0.224, 0.225)
 
 Local notebooks read `IMAGENET_ROOT`; Modal reads `/imagenet` from the `saliency-imagenet` volume.
 
+By default, `load_imagenet_subset` uses **`sorted`** order: validation images sorted by `ILSVRC2012_val_*.JPEG` filename. Pass `subset_order="imagefolder"` for alphabetical WNID folder order.
+
 ## Cascade Axis
 
 For each depth, the model is restored to pretrained weights and then cumulatively randomized from the classifier downward through `order[:depth + 1]`. Baseline maps are compared to randomized maps with Spearman and SSIM. RMS normalization is primary; max-abs is retained only as a legacy metric variant.
@@ -67,6 +69,8 @@ Shared metadata (cascade and occlusion):
 - `correctly_classified.npy` — boolean mask (`pred_argmax == ground_truth`); optional subset analysis only
 
 For full-grid deletion (opt-in via `--occlusion-patches`), outputs use the `_full` suffix: `occlusion_{method}_curve_full.npy`, `occlusion_{method}_auc_full.npy`.
+
+Analysis figure (Binder-style deletion curves, `notebooks/notebook_analysis.ipynb`): `results/figures/occlusion_faithfulness_curves.png` — mean target softmax vs occlusion step 0–30, one line per method, separate panel per architecture.
 
 ## Baseline and Target Policies
 

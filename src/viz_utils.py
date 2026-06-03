@@ -1,6 +1,7 @@
 """Visualization helpers for cascading saliency sanity-check figures."""
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
@@ -629,3 +630,185 @@ def plot_cascading_grid(
     else:
         plt.close(fig)
     return fig
+
+
+MECH_LOGIT_TAG = {
+    "resnet50": "resnet",
+    "vit": "vit",
+}
+
+
+def experiment_seed(results_dir: Path | str, default: int = 42) -> int:
+    """RNG seed recorded by cascade (used for Class A ``seed{N}/`` subdirs)."""
+    config_path = Path(results_dir) / "experiment_config.json"
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                return int(json.load(f).get("seed", default))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            pass
+    return default
+
+
+def load_arch_baseline_maps(
+    results_root: Path | str,
+    arch: str,
+    method: str,
+    norm: str = "raw",
+    seed: int | None = None,
+) -> np.ndarray:
+    """Load ``baseline_{method}.npz`` maps, including parallel-run ``seed{N}/`` paths."""
+    from experiment_utils import load_baseline_maps
+
+    arch_dir = Path(results_root) / arch
+    if seed is None:
+        seed = experiment_seed(arch_dir)
+    return load_baseline_maps(arch_dir, method, norm=norm, seed=seed)
+
+
+def _method_display_label(method: str) -> str:
+    return METHOD_DISPLAY_NAMES.get(method, method.replace("_", " "))
+
+
+def _load_step0_target_confidence(
+    results_root: Path,
+    arch: str,
+    mech_arch_tags: dict[str, str] | None = None,
+) -> np.ndarray | None:
+    """Per-image unoccluded softmax for the fixed occlusion target class."""
+    arch_dir = results_root / arch
+    targets_path = arch_dir / "target_indices.npy"
+    tags = mech_arch_tags or MECH_LOGIT_TAG
+    tag = tags.get(arch, arch)
+    logits_path = results_root / "mechanistic" / ("pretrained_logits_%s.npy" % tag)
+    if not targets_path.exists() or not logits_path.exists():
+        return None
+    import torch
+
+    targets = np.load(targets_path)
+    logits = np.load(logits_path)
+    probs = torch.softmax(torch.tensor(logits, dtype=torch.float64), dim=1).numpy()
+    n = min(len(targets), probs.shape[0])
+    return probs[np.arange(n), targets[:n]].astype(np.float64)
+
+
+def _occlusion_mean_std_curve(
+    curve_path: Path,
+    step0_per_image: np.ndarray | None,
+) -> tuple[np.ndarray | None, np.ndarray | None, bool]:
+    """Mean/std over images per occlusion step; prepend step 0 when available."""
+    if not curve_path.exists():
+        return None, None, False
+    curves = np.asarray(np.load(curve_path), dtype=np.float64)
+    mean_post = np.nanmean(curves, axis=0)
+    std_post = np.nanstd(curves, axis=0)
+    if step0_per_image is not None:
+        step0_mean = float(np.nanmean(step0_per_image))
+        step0_std = float(np.nanstd(step0_per_image))
+        mean = np.concatenate([[step0_mean], mean_post])
+        std = np.concatenate([[step0_std], std_post])
+        return mean, std, True
+    return mean_post, std_post, False
+
+
+def _plot_occlusion_curve_band(
+    ax,
+    x: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray | None,
+    label: str,
+    **kwargs,
+) -> None:
+    ax.plot(x, mean, marker="o", markersize=3, label=label, **kwargs)
+    if std is not None and np.any(std > 0):
+        ax.fill_between(x, mean - std, mean + std, alpha=0.18)
+
+
+def plot_occlusion_faithfulness_curves(
+    results_root: Path | str,
+    archs: dict[str, dict],
+    figures_dir: Path | str,
+    mech_arch_tags: dict[str, str] | None = None,
+    dpi: int = 150,
+    show: bool = True,
+) -> Path | None:
+    """
+    Binder-style blurred-patch deletion curves: mean target softmax vs step.
+
+    Loads ``occlusion_{method}_curve.npy`` (steps 1–30) and prepends step 0 from
+    saved mechanistic logits + target_indices when available.
+    """
+    results_root = Path(results_root)
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    arch_items = [(arch, cfg) for arch, cfg in archs.items() if cfg.get("methods")]
+    if not arch_items:
+        print("No architectures configured for occlusion faithfulness plot.")
+        return None
+
+    fig, axes = plt.subplots(1, len(arch_items), figsize=(6 * len(arch_items), 4.5))
+    if len(arch_items) == 1:
+        axes = [axes]
+
+    any_curve = False
+    used_step0 = True
+    for ax, (arch, cfg) in zip(axes, arch_items):
+        step0 = _load_step0_target_confidence(results_root, arch, mech_arch_tags)
+        if step0 is None:
+            used_step0 = False
+        plotted = 0
+        for method in cfg["methods"]:
+            curve_path = results_root / arch / ("occlusion_%s_curve.npy" % method)
+            mean, std, has_step0 = _occlusion_mean_std_curve(curve_path, step0)
+            if mean is None:
+                continue
+            if step0 is not None and not has_step0:
+                used_step0 = False
+            x = np.arange(len(mean)) if has_step0 else np.arange(1, len(mean) + 1)
+            _plot_occlusion_curve_band(
+                ax, x, mean, std, _method_display_label(method)
+            )
+            plotted += 1
+            any_curve = True
+        title = cfg.get("title", arch)
+        ax.set_title("%s — blurred-patch deletion" % title)
+        ax.set_xlabel("Occlusion step")
+        ax.set_ylabel("Mean target softmax confidence")
+        ax.set_ylim(0.0, 1.0)
+        if plotted:
+            ax.legend(fontsize=8, loc="best")
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No occlusion curve files found",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+
+    if not any_curve:
+        plt.close(fig)
+        print("No occlusion curve files found for faithfulness plot.")
+        return None
+
+    if not used_step0:
+        print(
+            "Warning: mechanistic logits or target_indices missing; "
+            "plotting occlusion steps 1–30 only (no step 0)."
+        )
+
+    fig.suptitle(
+        "Blurred-occlusion faithfulness (lower curves = more faithful)",
+        y=1.02,
+        fontsize=11,
+    )
+    fig.tight_layout()
+    out_path = figures_dir / "occlusion_faithfulness_curves.png"
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return out_path

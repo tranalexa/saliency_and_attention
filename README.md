@@ -158,7 +158,7 @@ Outputs: `results/figures/cascade_grid_<arch>.png` (jet heatmap overlaid on the 
 
 ### Dataset
 
-- ImageNet **validation**, first **500** images (Binder-style convention)
+- ImageNet **validation**, first **500** images in **sorted val filename order** (default `subset_order="sorted"` in `load_imagenet_subset`)
 - 224×224 center crop, standard ImageNet normalization
 - Set `IMAGENET_ROOT` in each notebook CONFIG cell (or env var), or upload val to Modal volume `saliency-imagenet`
 
