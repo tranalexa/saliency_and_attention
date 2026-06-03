@@ -1,44 +1,44 @@
 # Experimental Protocol
 
-Cascading model randomization and blurred-occlusion faithfulness on ResNet-50 and ViT-B/16.
+Operational checklist for cascade + occlusion on ResNet-50 and ViT-B/16.
 
 ## Scope
 
-| Dimension | Current Scope |
-|-----------|---------------|
+| Item | Value |
+|------|--------|
 | Architectures | `resnet50`, `vit` |
 | Class A | `gradient`, `input_grad`, `ig` |
-| Class B | ResNet `gradcam`; ViT `transformer_gradcam` |
-| Class C | ResNet `gbp`; ViT `raw_attn` |
-| Removed | DINOv2, `smoothgrad`, `gbp_gc`, `rollout`, `dino_attn` |
+| Class B | `gradcam` / `transformer_gradcam` |
+| Class C | `gbp` / `attention_rollout` |
+| Images | 500 val, sorted JPEG order |
+| Out of scope | DINOv2, `smoothgrad`, `gbp_gc`, `rollout`, `dino_attn` |
 
-## Cascade Protocol
+## Cascade
 
-| Setting | Behavior |
-|---------|----------|
-| Cascade order | Classifier first (`fc` / `head`), then top-to-bottom blocks |
-| ResNet randomization | Full Bottleneck module per step |
-| ViT randomization | Full transformer block per step |
-| Explanation class | `dynamic` by default; `frozen_baseline` for ablations |
-| Metrics | Spearman and SSIM against pretrained baseline maps |
-| Primary normalization | RMS |
+| Setting | Value |
+|---------|--------|
+| Order | Classifier first (`fc` / `head`), then blocks top → bottom |
+| Reset unit | Full ResNet Bottleneck or full ViT block |
+| Baseline | Pretrained, depth 0 |
+| Metrics | Spearman + SSIM vs baseline maps |
+| Target | `dynamic` (default) or `frozen_baseline` |
 
-## Blurred-Occlusion Protocol
+**Verify after run:**
 
-1. Load existing `baseline_{method}.npz` maps (run cascade first; occlusion does not recompute attributions).
-2. Denormalize each input, apply **box blur** (uniform kernel size = patch size = 15) in image space, then re-normalize.
-3. Rank 15×15 patches by absolute saliency intensity.
-4. Replace the top 30 highest-scoring patches in descending order with the blurred copy.
-5. Keep the step-0 target class (model argmax) fixed throughout deletion.
-6. AUC = mean softmax confidence over steps 1–30 (step 0 excluded). Lower AUC = more faithful.
+- `randomization_order.json` starts with `fc` (ResNet) or `head` (ViT).
+- `experiment_config.json` lists only scoped methods.
+- Depth-0 Spearman ≈ 1.0 per method.
+- ViT: depth-0 and depth-1 **attention_rollout** Spearman both 1.0 (expected).
 
-**Tensor separation:** Occlusion progressively replaces patches only inside `_blurred_deletion_curve` working copies. Cascade baseline maps, cascade metrics, and `qual_bundle.npz` attributions always run on clean cloned inputs via `_attribution_batch`. Do not run occlusion in the same process before recomputing baseline/qual unless images are reloaded from disk.
+## Occlusion
 
-Outputs: `occlusion_{method}_curve.npy` `(N, 30)`, `occlusion_{method}_auc.npy`, `occlusion_{method}_auc_mean.npy`, plus `ground_truth_indices.npy` and `correctly_classified.npy` from cascade runs.
+1. Cascade baselines exist (`baseline_{method}.npz`).
+2. Box blur 15×15, top-30 patches, fixed step-0 target.
+3. Outputs: `occlusion_{method}_curve.npy`, `_auc.npy`, `occlusion_config.json` with `"blur_type": "box"`.
 
-## Modal Rerun
+**Verify:** `ground_truth_indices.npy`, `correctly_classified.npy` present (from cascade).
 
-Delete or archive stale scoped folders before a clean rerun. The commands below do not remove old `dinov2` results; decide separately whether to archive or delete them.
+## Modal clean rerun
 
 ```bash
 modal volume rm saliency-results /resnet50 --recursive
@@ -47,23 +47,30 @@ modal volume rm saliency-results /mechanistic --recursive
 
 modal run modal/app.py --experiment resnet50 --num-images 10 --sequential --force-recompute
 modal run modal/app.py --experiment all --num-images 500 --parallel-methods --target-mode dynamic --force-recompute
-modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim --qual-force
+modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim_shared --qual-force
 
 ./scripts/download_modal_results.sh
 jupyter notebook notebooks/notebook_analysis.ipynb
 ```
 
-`--experiment all` runs cascade (ResNet + ViT), mechanistic controls, and occlusion (both architectures) in one invocation.
+`--experiment all` = cascade (both archs) + mechanistic + occlusion.
 
-## Verification
+## Manifest
 
-Confirm:
+After ImageNet is on the volume:
 
-- `randomization_order.json` starts with `fc` for ResNet and `head` for ViT.
-- `experiment_config.json` lists only scoped methods.
-- `gradcam_target` is `layer4[-1]` for ResNet and `blocks[-2]` for ViT. The ViT target is selected by `diagnostics/choose_vit_gradcam_layer.py`, which rejected final-block targets as degenerate.
-- No active result generation writes DINOv2 or removed-method outputs.
-- Occlusion outputs include `occlusion_{method}_curve.npy` and `occlusion_{method}_auc.npy`.
-- `occlusion_config.json` records `"blur_type": "box"` by default.
-- `ground_truth_indices.npy` and `correctly_classified.npy` are present after cascade runs.
-- Cross-architecture summaries use sensitivity-ratio JSON/table outputs only.
+```bash
+modal run modal/build_subset_manifest.py
+```
+
+Maps `dataset_index` → filename, WNID, class name. Use for fixed qual indices (e.g. `--image-index 196`).
+
+## Analysis verification
+
+- Within-arch plots include **attention_rollout** (loads `raw_attn_*` if needed).
+- Sensitivity table includes **Class C** rows.
+- No raw ResNet–ViT Spearman overlay (by design).
+
+## Tensor hygiene
+
+Never run occlusion then cascade/qual in one process without reloading images. Occlusion uses blurred working tensors; cascade uses `_attribution_batch` on clean clones.

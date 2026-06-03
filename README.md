@@ -1,240 +1,96 @@
+# Sanity Checks for Saliency Maps
 
-Sanity Checks for Saliency Maps
-=====================
-This repository provides code to replicate the paper
-**Sanity Checks for Saliency Maps** by<br/>
-*Julius Adebayo, Justin Gilmer, Michael Muelly, Ian Goodfellow, Moritz Hardt, & Been Kim*.
+Replication and extension of Adebayo et al. (*Sanity Checks for Saliency Maps*) with a **PyTorch** pipeline for **ResNet-50** and **ViT-B/16** on ImageNet, plus a **blurred-patch occlusion** faithfulness axis (Binder et al.).
 
-<img src="https://raw.githubusercontent.com/adebayoj/sanity_checks_saliency/master/doc/figures/saliency_methods_and_edge_detector.png" width="700">
+The original TensorFlow / Inception / MNIST replication remains under `notebooks/legacy_tf/` (see [legacy section](#legacy-tensorflow-replication) below).
 
+## What this fork measures
 
-### Overview
+**Cascade axis (Adebayo):** Cumulatively reinitialize weights from the classifier downward. At each depth, compare saliency on the randomized model to maps from the fully pretrained model (Spearman + SSIM). Methods that stay visually similar while logits decorrelate fail the sanity check.
 
-Saliency methods have emerged as a popular tool to highlight
-features in an input deemed relevant for the prediction of a
-learned model. Several saliency methods have been proposed, often
-guided by visual appeal on image data. In this work, we propose
-an actionable methodology to evaluate what kinds of explanations
-a given method can and cannot provide. We find that reliance,
-solely, on visual assessment can be misleading. Through extensive
-experiments we show that some existing saliency methods are
-independent both of the model and of the data generating process.
-Consequently, methods that fail the proposed tests are
-inadequate for tasks that are sensitive to either data or model,
-such as, finding outliers in the data, explaining the
-relationship between inputs and outputs that the model learned,
-or debugging the model. We interpret our findings through an
-analogy with edge detection in images, a technique that requires
-neither training data nor model. Theory in the case of a
-linear model and a single-layer convolutional neural network
-supports our experimental findings.
+**Occlusion axis (Binder):** Using fixed baseline attribution maps, delete the top 30 blurred 15×15 patches and track target-class softmax (AUC). Lower AUC ⇒ more faithful map.
 
-#### Model Randomization Test
+**Cross-architecture comparison:** Use **sensitivity ratio** \(D_{\text{half}}^{\text{method}} / D_{\text{half}}^{\text{arch}}\) from saved curve stats — not raw overlay of ResNet vs ViT Spearman curves.
 
-For the model randomization test, we randomize the weights of a
-model starting from the top layer, successively, all the way to
-the bottom layer. This procedure destroys the learned
-weights from the top layers to the bottom ones. We compare the resulting explanation from a network with random weights to the one obtained with the model's original weights. Below we show the
-evolution of saliency masks from different methods for a demo image from the ImageNet dataset and the Inception v3 model.
-
-<img src="https://raw.githubusercontent.com/adebayoj/sanity_checks_saliency/master/doc/figures/bird_cascading_demo.png" width="700">
-
-##### Independent Layer randomization
-
-Here we show the results of randomizing each 'layer/block' at a time while keeping the other weights set at the pre-trained (original) values.
-
-<img src="https://raw.githubusercontent.com/adebayoj/sanity_checks_saliency/master/doc/figures/bird_independent_demo.png" width="700">
-
-#### Data Randomization Test
-
-In our data randomization test, we permute the training labels
-and train a model on the randomized training data. A model
-achieving high training accuracy on the randomized training data
-is forced to memorize the randomized labels without being able to
-exploit the original structure in the data. We now compare
-saliency masks for a model trained on random labels and one
-trained true labels. We present examples below on MNIST and Fashion MNIST.
-
-<img src="https://raw.githubusercontent.com/adebayoj/sanity_checks_saliency/master/doc/figures/mnist_cnn_random_labels_test.png" width="700">
-
-See the paper and appendix for additional figures and results on the data randomization test.
-
-
-#### Guided Backprop Errata
-A previous version of the paper said that Guided Backprop was completely invariant to model randomization (weight re-initialization); however, this is not the case. Guided Backprop is still invariant to higher layer weights of a DNN, but it is not completely invariant. As we show in the figure below, when the lower layers are randomized, there is indeed a distortion to the mask. However, we still observe that there is high visual similarity between the mask derived from a completely reinitialized model and the input. Overall, the findings in the paper remain unchanged. We have recently updated the arxiv version as well. See the inceptionv3_guidedbackprop_demo.ipynb in the notebook folder for replication.
-
-<img src="https://raw.githubusercontent.com/adebayoj/sanity_checks_saliency/master/doc/figures/guided_backprop_demo.png" width="700">
-
-### Data
-
-See /doc/data/ for the demo images and the ImageNet image ids used in this
-work.  
-
----
-
-## PyTorch extension (ResNet-50, ViT-B/16, occlusion)
-
-This fork adds a **PyTorch + timm + Captum + pytorch-grad-cam** pipeline that
-extends Adebayo's cascading model randomization test to ResNet-50 and ViT-B/16,
-and adds a fixed-target blurred-occlusion faithfulness axis.
-
-### Setup (virtual environment)
-
-From the repo root:
+## Quick start
 
 ```bash
-./scripts/setup_venv.sh
-source .venv/bin/activate
+./scripts/setup_venv.sh && source .venv/bin/activate
+export IMAGENET_ROOT=/path/to/imagenet   # local only; needs val/
 ```
 
-This installs [`requirements-pytorch.txt`](requirements-pytorch.txt) (notebooks, local GPU) and [`requirements-modal.txt`](requirements-modal.txt) (Modal CLI). To install manually:
+| Task | Command / doc |
+|------|----------------|
+| Cloud GPU runs | [docs/modal.md](docs/modal.md) |
+| Methods, data, metrics | [docs/experimental_setup.md](docs/experimental_setup.md) |
+| Rerun checklist | [docs/experimental_protocol.md](docs/experimental_protocol.md) |
+| Figures (no GPU) | `jupyter notebook notebooks/notebook_analysis.ipynb` |
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements-pytorch.txt -r requirements-modal.txt
-```
-
-For **local** notebook runs (not Modal):
-
-```bash
-export IMAGENET_ROOT=/path/to/imagenet   # must contain val/
-jupyter notebook notebooks/
-```
-
-### Notebooks
-
-| Notebook | Purpose | Outputs |
-|----------|---------|---------|
-| `notebooks/notebook_resnet50_cascading.ipynb` | ResNet-50 cascade sanity checks | `results/resnet50/` |
-| `notebooks/notebook_vit_cascading.ipynb` | ViT-B/16 cascade sanity checks | `results/vit/` |
-| `notebooks/notebook_mechanistic.ipynb` | Logit correlation & activation scales (ResNet vs ViT) | `results/mechanistic/` |
-| `notebooks/notebook_analysis.ipynb` | Figures only (no model loading) | `results/figures/` |
-
-Legacy TensorFlow replication notebooks live in `notebooks/legacy_tf/`.
-
-### Shared utilities (`src/`)
-
-- `experiment_utils.py` — full pipelines (data loading, Captum, cascading, occlusion, mechanistic); used by notebooks and Modal
-- `randomize_utils.py` — cascading weight reset (`reset_layer`, checkpoints, layer orders)
-- `metrics_utils.py` — Spearman, SSIM, logit Pearson correlation, map normalization
-- `viz_utils.py` — Adebayo-style cascade figure grids (`qual_bundle.npz` → paper PNGs)
-- `attention_utils.py` — ViT raw attention and entropy validation
-
-### Running on Modal (cloud GPU)
-
-Run computation without local ImageNet storage. See **[docs/modal.md](docs/modal.md)** for full instructions.
-
-```bash
-source .venv/bin/activate
-modal setup
-# ImageNet on Modal (pick one):
-#   A) Download in cloud: modal run modal/download_imagenet.py --val-tar-url URL --devkit-tar-url URL
-#   B) Upload from laptop: modal volume put saliency-imagenet /path/to/imagenet/val /val
-modal run modal/app.py --experiment resnet50 --num-images 10 --skip-qual   # smoke test
-# Full study: parallel cascade + qual + mechanistic + occlusion (500 images)
-modal run modal/app.py --experiment all --num-images 500 --parallel-methods --target-mode dynamic --force-recompute
-# Occlusion only (requires cascade baseline maps):
-modal run modal/app.py --experiment occlusion --num-images 500
+# Modal smoke test
+modal run modal/app.py --experiment resnet50 --num-images 10 --skip-qual
+# Full study (500 images, parallel methods)
+modal run modal/app.py --experiment all --num-images 500 --parallel-methods --target-mode dynamic
 ./scripts/download_modal_results.sh
-jupyter notebook notebooks/notebook_analysis.ipynb
 ```
 
-Uses **NVIDIA A10G** by default. Full 500-image runs are expensive; always smoke-test with `--num-images 10` first.
+## Methods (active scope)
 
-### Qualitative cascade figures (paper)
+| Class | ResNet-50 | ViT-B/16 | Role |
+|-------|-----------|----------|------|
+| A | `gradient`, `input_grad`, `ig` | same | Portable gradients (Captum) |
+| B | `gradcam` | `transformer_gradcam` | Native spatial attribution (`blocks[-2]` for ViT) |
+| C | `gbp` | `attention_rollout` | Arch-specific (Guided Backprop; 12-layer Abnar attention rollout) |
 
-Quant runs can use `--skip-qual` (faster). Build `qual_bundle.npz` afterward (one GPU per architecture, all methods):
+Removed from active runs: DINOv2, `smoothgrad`, `gbp_gc`, legacy `rollout`, `dino_attn`.
+
+## Data
+
+- ImageNet **val**, first **500** images in **sorted JPEG filename order** (`ILSVRC2012_val_00000001.JPEG`, …) — same indices for ResNet and ViT.
+- Human-readable index: `results/diagnostics/subset_manifest_first500.json` (build with `scripts/build_subset_manifest.py` or `modal run modal/build_subset_manifest.py`).
+- 224×224 center crop, standard ImageNet normalization.
+
+## Repository layout
+
+| Path | Role |
+|------|------|
+| `src/experiment_utils.py` | Pipelines: cascade, occlusion, qual bundle, mechanistic |
+| `src/attention_utils.py` | ViT attention rollout + validation hooks |
+| `src/viz_utils.py` | Cascade grids, occlusion curves, analysis plots |
+| `notebooks/notebook_analysis.ipynb` | All paper figures from saved `.npy` / `.npz` |
+| `modal/app.py` | Modal entrypoint |
+| `results/` | Local outputs (gitignored) |
+
+## Qualitative figures
+
+Quant runs can use `--skip-qual`. Build `qual_bundle.npz` later:
 
 ```bash
-modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim
-# Or Adebayo default (first val image): --image-index-mode fixed --image-index 0
+modal run modal/app.py --experiment all --qual-only \
+  --image-index-mode fixed --image-index 196 --qual-force   # example: hotdog in manifest
 ./scripts/download_modal_results.sh
-jupyter notebook notebooks/notebook_analysis.ipynb
+# Re-run notebook_analysis.ipynb
 ```
 
-Outputs: `cascade_grid_<arch>.png` (primary: jet overlay on input, same as commit 33413b2), `cascade_grid_<arch>_masks.png` (gray masks). Optional extras: `_bwr_pct`, `_jet_pct`, `_turbo_pct`, etc. Rebuild `qual_bundle.npz` with `--qual-force` after pipeline changes.
+Outputs under `results/figures/`: `within_arch_*_spearman.png`, `cascade_grid_*.png`, `occlusion_faithfulness_curves.png`, sensitivity-ratio table, etc.
 
-### Dataset
+## ViT-specific note
 
-- ImageNet **validation**, first **500** images in **sorted val filename order** (default `subset_order="sorted"` in `load_imagenet_subset`)
-- 224×224 center crop, standard ImageNet normalization
-- Set `IMAGENET_ROOT` in each notebook CONFIG cell (or env var), or upload val to Modal volume `saliency-imagenet`
+Cascade order randomizes **`head` first**, then `blocks.11` … `blocks.0`. **Attention rollout** only uses block self-attention, so **depth 0 and depth 1 maps are identical** (head-only randomization). Expect slow visual drift until lower blocks are randomized. See [docs/experimental_setup.md](docs/experimental_setup.md).
 
-### Cascading randomization order (Adebayo-style)
+## Legacy TensorFlow replication
 
-Weights are reinitialized **cumulatively** starting at the **classifier** (`fc` / `head` = Logits), then deeper blocks toward the input (ResNet: `Mixed_7c` … `Conv2d_*`; ViT: `TF block 11` … `TF block 0`). Matches the Inception notebook in `notebooks/legacy_tf/inceptionv3_cascading_randomization.ipynb`.
+Original paper demos (Inception v3, MNIST) live in `notebooks/legacy_tf/`. Setup:
 
-If you have results from an older commit that randomized deep layers first, delete `results/<arch>/*_spearman*.npy` (and related files) and re-run the quant pipeline.
-
-### Expected qualitative behavior (ResNet replication)
-
-ResNet-50 runs the scoped methods Gradient, Input-Grad, IG, GradCAM, and GBP:
-
-- **Guided Backprop / Input-Grad**: often preserve visual structure when only upper layers are randomized.
-- **Integrated Gradients / Gradient / GradCAM**: expected to respond more directly as relevant pretrained structure is destroyed.
-
-**MNIST** (used in the original paper's Figure 20) is a dataset of 70,000 handwritten digit images (0–9), 28×28 pixels — a classic deep-learning benchmark. The legacy TensorFlow MNIST notebooks live in `notebooks/legacy_tf/`.
-
-### Saliency method sets
-
-| Class | ResNet-50 | ViT-B/16 | Notes |
-|-------|-----------|----------|-------|
-| A | Gradient, Input-Grad, IG | Gradient, Input-Grad, IG | Portable gradient methods |
-| B | GradCAM | Transformer GradCAM | Architecture-native spatial attribution |
-| C | GBP | Raw attention | Architecture-specific diagnostics |
-
-DINOv2, SmoothGrad, GBP×GradCAM, attention rollout, and DINO attention references are out of active scope. Raw cross-architecture curve overlays are intentionally omitted; cross-architecture summaries use sensitivity ratio only.
-
----
-
-### Instructions (legacy TensorFlow)
-
-We have added scripts for training simple MLPs and CNNs on MNIST. To run any of the MNIST notebooks, use these scripts to quickly train either an MLP on MNIST (or Fashion MNIST) or a CNN on MNIST (or Fashion MNIST). The scripts are relatively straight forward. To run the inception v3 notebooks, you will also need to grab pre-trained weights and put them models folder as described in the instructions below.
-
-We use the [saliency python package](https://github.com/pair-code/saliency) to obtain saliency masks. Please see that package for a quick overview. Overall, this replication is mostly for illustration purposes. There are now other packages in PyTorch that provide similar capabilities.
-
-You can use the instructions below to setup an environment with the right dependencies.
-
-```
-python3.5 -m venv pathtovirtualvenv
-source pathtovirtualvenv/bin/activate
+```bash
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Train simple CNNs/MLPs on MNIST/Fashion MNIST
-You can train a CNN on MNIST using *src/train_cnn_models.py* as follows:
-```
-python train_cnn_models.py --data mnist --savemodelpath ../models/ --reg --log
-```
+Train MNIST models with `src/train_cnn_models.py` / `src/train_mlp_models.py`. Inception weights: [TensorFlow checkpoint](http://download.tensorflow.org/models/inception_v3_2016_08_28.tar.gz) → `models/inceptionv3/inception_v3.ckpt`.
 
-You can toggle the data with the --data option. You can also train MLPs with an analogous command:  
+Legacy notebooks: `cnn_mnist_cascading_randomization.ipynb`, `inceptionv3_cascading_randomization.ipynb`, etc.
 
-```
-python train_mlp_models.py --data mnist --savemodelpath ../models/ --reg --log
-```
+---
 
-To run the CNN and MLP on MNIST notebooks, you will need to train quick models with the commands above.
-
-### Inception V3 Checkpoint (Important!)
-To run any of the incetion_v3 notebooks, you will need inception pretrained weights. These are available from [tensorflow](http://download.tensorflow.org/models/inception_v3_2016_08_28.tar.gz). Alternatively, the weights can be obtained and decompressed as follows:
-
-```
-wget http://download.tensorflow.org/models/inception_v3_2016_08_28.tar.gz
-tar -xvzf inception_v3_2016_08_28.tar.gz
-```
-
-At the end of this, you should have the file *inception_v3.ckpt* in the folder *models/inceptionv3*. With this, you can run the inception notebooks.
-
-
-#### Notebooks (legacy TensorFlow)
-
-In `notebooks/legacy_tf/`, you will find replication of the key experiments in the paper:
-
-- *cnn_mnist_cascading_randomization.ipynb*: cascading randomization on a CNN trained on MNIST.
-- *cnn_mnist_independent_randomization.ipynb*: independent randomization on a CNN trained on MNIST.
-- *inceptionv3_cascading_randomization.ipynb*: cascading randomization on Inception v3 (ImageNet).
-- *inceptionv3_independent_layer_randomization.ipynb*: independent randomization for Inception v3.
-- *inception_v3_guidedbackprop_demo.ipynb*: guided backprop with cascading randomization.
-- *mlp_mnist_cascading_randomization.ipynb*: cascading randomization on an MLP trained on MNIST.
+*Paper:* [Sanity Checks for Saliency Maps](https://arxiv.org/abs/1806.07529) — Adebayo, Gilmer, Muelly, Goodfellow, Hardt, Kim.

@@ -1,100 +1,101 @@
 # Experimental Setup
 
-This repository now targets a narrowed saliency sanity-check study:
+Scoped study: **ResNet-50** and **ViT-B/16** on ImageNet val (500 images), **cascade randomization** (Adebayo) and **blurred occlusion** (Binder). Cross-architecture comparison uses **sensitivity ratio** only.
 
-- Architectures: `resnet50` and `vit` only.
-- Cascade axis: cumulative top-down model randomization.
-- Faithfulness axis: fixed-target blurred-patch deletion.
-- Cross-architecture comparison: sensitivity ratio only.
+## Conceptual framing
+
+**Model randomization test:** If a saliency map still looks “meaningful” after weights that drive predictions are destroyed, the method may be acting like an edge detector — insensitive to the model.
+
+**Faithfulness test:** If occluding high-attribution regions does not drop target confidence, the map may not reflect what the model uses.
+
+Together: cascade tests *model sensitivity*; occlusion tests *input faithfulness* on a fixed explanation target.
 
 ## Models
 
-| Architecture | Source | Cascade Order | Class B Target |
-|--------------|--------|---------------|----------------|
-| ResNet-50 | `timm.create_model("resnet50", pretrained=True)` | `fc`, then `layer4.2` ... `layer1.0` | GradCAM on `layer4[-1]` |
-| ViT-B/16 | `timm.create_model("vit_base_patch16_224", pretrained=True, img_size=224)` | `head`, then `blocks.11` ... `blocks.0` | Transformer GradCAM on `blocks[-2]` |
+| Arch | timm id | Cascade order (first → last) | Class B hook |
+|------|---------|------------------------------|--------------|
+| ResNet-50 | `resnet50` | `fc`, `layer4.2` … `layer1.0` | GradCAM on `layer4[-1]` |
+| ViT-B/16 | `vit_base_patch16_224` | `head`, `blocks.11` … `blocks.0` | Transformer GradCAM on `blocks[-2]` |
 
-DINOv2 is out of scope and is not an active architecture.
+ViT GradCAM target: `diagnostics/choose_vit_gradcam_layer.py` — final block was degenerate; `blocks[-2]` was the latest non-degenerate layer.
 
-## Method Sets
+## Method sets
 
-| Class | ResNet-50 | ViT-B/16 | Role |
-|-------|-----------|----------|------|
-| A | `gradient`, `input_grad`, `ig` | `gradient`, `input_grad`, `ig` | Portable gradient methods |
-| B | `gradcam` | `transformer_gradcam` | Architecture-native spatial attribution |
-| C | `gbp` | `raw_attn` | Architecture-specific diagnostics |
+| Class | ResNet | ViT | Implementation |
+|-------|--------|-----|----------------|
+| A | `gradient`, `input_grad`, `ig` | same | Captum; IG default baseline `zero`, 50 steps |
+| B | `gradcam` | `transformer_gradcam` | pytorch-grad-cam |
+| C | `gbp` | `attention_rollout` | Guided Backprop; **Abnar & Zuidema (2020) 12-layer attention rollout** |
 
-Removed active methods: `smoothgrad`, `gbp_gc`, `rollout`, and `dino_attn`.
+**Attention rollout:** Hooks post-softmax QK attention in every ViT block; head-mean; \(0.5 A + 0.5 I\); row-normalize; chain \(\bar{A}_i = A_i \bar{A}_{i-1}\); CLS→patch weights → 14×14 grid → upsample 224. Entropy diagnostic uses **last block only**.
 
-The ViT Transformer GradCAM target was selected empirically with
-`diagnostics/choose_vit_gradcam_layer.py`: final-block candidates were
-degenerate on all sampled images, while `blocks[-2]` was the latest candidate
-with 0% degenerate maps on the pretrained model and tested cascade states.
+**ViT cascade caveat:** `head` is randomized at depth 1 but rollout ignores it → **identical maps at depths 0 and 1**. Early columns in qual grids can look the same until lower blocks are hit.
+
+**Artifact aliases:** Older runs wrote `raw_attn_*`; code accepts `attention_rollout` ↔ `raw_attn` via `METHOD_ARTIFACT_ALIASES`.
 
 ## Data
 
-All runs use ImageNet validation images with `Resize(256)`, `CenterCrop(224)`, `ToTensor`, and ImageNet normalization:
-
 ```python
 mean = (0.485, 0.456, 0.406)
-std = (0.229, 0.224, 0.225)
+std  = (0.229, 0.224, 0.225)
 ```
 
-Local notebooks read `IMAGENET_ROOT`; Modal reads `/imagenet` from the `saliency-imagenet` volume.
+- Default subset: **`sorted`** val JPEG order (`SortedValDataset`), indices `0 … N-1` shared across architectures.
+- Alternative: `subset_order="imagefolder"` (WNID folder order — not comparable to sorted runs).
 
-By default, `load_imagenet_subset` uses **`sorted`** order: validation images sorted by `ILSVRC2012_val_*.JPEG` filename. Pass `subset_order="imagefolder"` for alphabetical WNID folder order.
+**Manifest** (`results/diagnostics/subset_manifest_first500.json`):
 
-## Cascade Axis
+```bash
+python scripts/build_subset_manifest.py --imagenet-root "$IMAGENET_ROOT"
+# Modal: modal run modal/build_subset_manifest.py
+```
 
-For each depth, the model is restored to pretrained weights and then cumulatively randomized from the classifier downward through `order[:depth + 1]`. Baseline maps are compared to randomized maps with Spearman and SSIM. RMS normalization is primary; max-abs is retained only as a legacy metric variant.
+`dataset_index` in the manifest = cascade / occlusion / qual `image_index`.
 
-The default cascade target policy is `dynamic`: explain the current model argmax at each depth. `frozen_baseline` remains available for ablations.
+## Cascade axis
 
-## Blurred-Occlusion Axis
+1. Save **baseline** maps on pretrained model (`baseline_{method}.npz`).
+2. For each depth `d ∈ [0, |order|]`: restore pretrained weights, randomize `order[:d]`, compute maps on clean inputs.
+3. Compare to baseline: Spearman (RMS primary; signed RMS for IG/input_grad) and SSIM variants.
+4. Default target: **`dynamic`** — argmax class at each depth. Ablation: **`frozen_baseline`**.
 
-Following Binder et al. (2023) Section A.1, the occlusion axis loads existing baseline maps (does not recompute attributions), ranks non-overlapping 15×15 patches by absolute saliency, and replaces the top 30 highest-scoring patches with a blurred copy of the same normalized input. **Box blur** (uniform 15×15 kernel) is the default, applied in `[0, 1]` image space after denormalization. Use `--blur-type gaussian` for the legacy Gaussian ablation.
+Depth 0 Spearman must be ≈ 1.0 (sanity check in code).
 
-The target class is fixed at step 0 (model argmax) and is never re-argmaxed during deletion. AUC is the mean softmax confidence over the 30 post-occlusion steps (step 0 excluded). Lower AUC indicates more faithful attribution.
+Curve summaries: `{method}_curve_stats.json`, `{method}_sensitivity_ratio.json` for all scored methods (A, B, C).
 
-Outputs per method:
+## Occlusion axis
 
-- `occlusion_{method}_curve.npy` — `(N, 30)` softmax confidence after each replacement
-- `occlusion_{method}_auc.npy` — `(N,)` mean confidence over 30 steps per image
-- `occlusion_{method}_auc_mean.npy` — scalar mean AUC over all images
-- `occlusion_config.json`
+Requires cascade baselines first. Does **not** recompute attributions in the deletion loop.
 
-Shared metadata (cascade and occlusion):
+- 15×15 patches, top **30** by |saliency|, **box blur** kernel 15 (Binder A.1 default).
+- Target class = step-0 argmax, fixed for all steps.
+- AUC = mean softmax over steps 1–30 (lower = more faithful).
 
-- `ground_truth_indices.npy` — ImageNet validation labels
-- `correctly_classified.npy` — boolean mask (`pred_argmax == ground_truth`); optional subset analysis only
+**Isolation:** Occlusion mutates working copies only; cascade/qual always use `_attribution_batch` clones.
 
-For full-grid deletion (opt-in via `--occlusion-patches`), outputs use the `_full` suffix: `occlusion_{method}_curve_full.npy`, `occlusion_{method}_auc_full.npy`.
+## Mechanistic controls
 
-Analysis figure (Binder-style deletion curves, `notebooks/notebook_analysis.ipynb`): `results/figures/occlusion_faithfulness_curves.png` — mean target softmax vs occlusion step 0–30, one line per method, separate panel per architecture.
+`--experiment mechanistic` → `results/mechanistic/`:
 
-## Baseline and Target Policies
+- `logit_corr_{resnet,vit}.npy` — Pearson corr. of pretrained vs cascade logits (per depth).
+- `activation_scale_{tag}_depth{NN}.npy` — mean |activation| per channel.
 
-| Decision | Default | Scope |
-|----------|---------|-------|
-| Cascade `--target-mode` | `dynamic` | Adebayo: explain current model argmax at each randomization depth |
-| Occlusion target | fixed step-0 argmax | Binder: softmax drop for the explained class |
-| IG `--ig-baseline` | `zero` | Integrated Gradients reference input only |
-| Occlusion blur | `box` (kernel = patch size) | Binder Section A.1 |
+Used for logit-correlation bands in analysis plots and \(D_{\text{arch}}\) in sensitivity ratio.
 
-`frozen_baseline` cascade mode remains available as an ablation (fixed semantic class across depths). Occlusion is unaffected by cascade `target_mode`.
+## Analysis outputs
 
-## Mechanistic Controls
+`notebooks/notebook_analysis.ipynb` (no model load):
 
-`--experiment mechanistic` writes logit-correlation and activation-scale controls for ResNet-50 and ViT-B/16 only:
+| Figure / table | Source |
+|----------------|--------|
+| `within_arch_{arch}_spearman.png` | `{method}_spearman_*_mean.npy` (alias-aware) |
+| `class_b_spatial_attribution_within_arch.png` | GradCAM / transformer_gradcam |
+| ViT rollout + entropy panel | `attention_rollout` curve + `*_entropy_depth*.npy` |
+| `occlusion_faithfulness_curves.png` | `occlusion_{method}_curve.npy` |
+| Sensitivity-ratio LaTeX table | `*_curve_stats.json` (Class A, B, C) |
 
-- `logit_corr_resnet.npy`
-- `logit_corr_vit.npy`
-- `activation_scale_{tag}_depth{NN}.npy`
+Attention-rollout qual rows use **shared row-wise display scaling** so depth differences are visible (per-panel minmax was misleading).
 
-## Sensitivity Ratio
+## Stale artifacts
 
-Raw cross-architecture Spearman or SSIM curves are not used as the comparison unit. Cross-architecture summaries use `sensitivity_ratio = D_half / D_arch`, where `D_arch` comes from logit correlation. Curve stats are saved for Class A and Class B methods as `{method}_curve_stats.json` and `{method}_sensitivity_ratio.json`.
-
-## Stale Results
-
-Do not mix old and current results. Older artifacts may include `results/dinov2/` or outputs for `smoothgrad`, `gbp_gc`, `rollout`, and `dino_attn`. These should be archived or deleted before final reporting; they were intentionally not deleted by this cleanup.
+Do not mix runs from removed methods (`dinov2`, `smoothgrad`, `gbp_gc`, `rollout`, `dino_attn`) or old cascade orders (deep-to-shallow). Delete `results/<arch>/*_spearman*.npy` and re-run after protocol changes.

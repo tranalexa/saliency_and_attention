@@ -1,107 +1,98 @@
-# Running Experiments on Modal
+# Modal Runs
 
-This guide runs the scoped PyTorch pipelines on Modal A10G GPUs without keeping ImageNet on your laptop.
+Run ResNet / ViT pipelines on **Modal A10G** without local ImageNet.
 
 ## Setup
 
 ```bash
-./scripts/setup_venv.sh
-source .venv/bin/activate
-modal setup
-```
-
-Upload or download ImageNet validation into the `saliency-imagenet` volume:
-
-```bash
+./scripts/setup_venv.sh && source .venv/bin/activate && modal setup
 modal volume create saliency-imagenet
-modal run modal/download_imagenet.py \
-  --val-tar-url "https://image-net.org/data/.../ILSVRC2012_img_val.tar" \
-  --devkit-tar-url "https://image-net.org/data/.../ILSVRC2012_devkit_t12.tar"
 ```
 
-If you already have class-organized validation data:
+ImageNet on volume (pick one):
 
 ```bash
+# Download in cloud
+modal run modal/download_imagenet.py --val-tar-url URL --devkit-tar-url URL
+
+# Upload local val/
 modal volume put saliency-imagenet /path/to/imagenet/val /val
 ```
 
+Results volume: `saliency-results` (default).
+
 ## Experiments
 
-Accepted `--experiment` values:
-
-- `resnet50`
-- `vit`
-- `mechanistic`
-- `occlusion`
-- `all` (cascade for ResNet/ViT, mechanistic, and occlusion)
-
-Common commands:
+| `--experiment` | Runs |
+|----------------|------|
+| `resnet50` / `vit` | Cascade (+ qual unless `--skip-qual`) |
+| `mechanistic` | Logit correlation + activation scales |
+| `occlusion` | Blurred deletion (needs baselines) |
+| `all` | Cascade both archs + mechanistic + occlusion |
 
 ```bash
-# Cheap cascade smoke
-modal run modal/app.py --experiment resnet50 --num-images 10 --skip-qual --sequential
+# Smoke
 modal run modal/app.py --experiment vit --num-images 10 --skip-qual --sequential
 
-# Full study: parallel cascade + qual + mechanistic + occlusion (500 images)
-modal run modal/app.py --experiment all --num-images 500 --parallel-methods --target-mode dynamic --seeds 42,1,2
+# Full quant (500 images, parallel one GPU per method)
+modal run modal/app.py --experiment all --num-images 500 --parallel-methods --target-mode dynamic --force-recompute
 
-# Faster quant-only rerun (skip qual figures):
-modal run modal/app.py --experiment all --num-images 500 --skip-qual --parallel-methods --target-mode dynamic
-
-# Occlusion only (after cascade baseline maps exist)
+# Occlusion only
 modal run modal/app.py --experiment occlusion --num-images 500
 
-# Qualitative cascade grids after cascade outputs exist
-# Same demo image for ResNet and ViT (shared SSIM pick across both result dirs):
+# Qual grids (after cascade)
 modal run modal/app.py --experiment all --qual-only --image-index-mode auto_ssim_shared --qual-force
-# Or fix an index from subset_manifest_first500.json (dataset_index N = same JPEG for both archs):
-modal run modal/app.py --experiment all --qual-only --image-index-mode fixed --image-index 38 --qual-force
 ```
 
-`--experiment occlusion` runs both scoped architectures by default. Use `--occlusion-arch resnet50` or `--occlusion-arch vit` to run one architecture.
-
-## CLI Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--experiment` | `resnet50` | `resnet50`, `vit`, `mechanistic`, `occlusion`, or `all` |
-| `--num-images` | `500` | Number of ImageNet validation images |
-| `--batch-size` | `8` | Batch size; mechanistic uses 16 internally |
-| `--skip-qual` | false | Skip `qual_bundle.npz` (faster; use `--qual-only` afterward) |
-| `--qual-only` | false | Only build `qual_bundle.npz` |
-| `--parallel-methods` | true | Spawn one GPU job per saliency method (default on) |
-| `--sequential` | false | Run one architecture on one GPU |
-| `--force-recompute` | false | Ignore cached outputs |
-| `--target-mode` | `dynamic` | Cascade target policy |
-| `--seed` | `42` | Primary RNG seed |
-| `--seeds` | `42` | Class A multi-seed list for parallel cascade runs |
-| `--ig-baseline` | `zero` | Integrated Gradients baseline: `zero` or `mean` |
-| `--ig-steps` | `50` | Integrated Gradients interpolation steps |
-| `--occlusion-arch` | `all` | `resnet50`, `vit`, or `all` for occlusion |
-| `--occlusion-patches` | `30` | Top-K patches to occlude (Binder A.1 default; increase for full-grid) |
-| `--occlusion-patch-size` | `15` | Patch and blur kernel size (15 = Binder main; 8 = appendix robustness) |
-| `--blur-type` | `box` | Occlusion blur: `box` (Binder default) or `gaussian` (legacy ablation) |
-| `--blur-sigma` | `8.0` | Gaussian sigma only; ignored when `--blur-type=box` |
-
-## Results
-
-Results are written to the `saliency-results` volume under `/<arch>/`, e.g. `/resnet50/` and `/vit/`. Download the scoped folders with:
+Download → analyze:
 
 ```bash
 ./scripts/download_modal_results.sh
-```
-
-Then run:
-
-```bash
 jupyter notebook notebooks/notebook_analysis.ipynb
 ```
 
-The helper downloads `resnet50`, `vit`, and `mechanistic`. It intentionally does not download stale `dinov2` folders.
+Downloads `resnet50/`, `vit/`, `mechanistic/` only (not stale `dinov2/`).
 
-## Stale Results
+## Useful flags
 
-After protocol changes, delete scoped folders or pass `--force-recompute`:
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--skip-qual` | false | Faster; run `--qual-only` later |
+| `--parallel-methods` | true | One GPU per method |
+| `--force-recompute` | false | Ignore cached metrics |
+| `--target-mode` | `dynamic` | Cascade explanation class |
+| `--seeds` | `42` | Class A can use `42,1,2` → `seed42/` subdirs |
+| `--occlusion-arch` | `all` | `resnet50` \| `vit` \| `all` |
+| `--image-index` | `0` | With `--qual-only --image-index-mode fixed` |
+| `--qual-force` | false | Overwrite `qual_bundle.npz` |
+
+## Manifest on Modal
+
+```bash
+modal run modal/build_subset_manifest.py
+# Writes locally + volume diagnostics/subset_manifest_first500.json
+```
+
+Pick `dataset_index` from manifest for qual, e.g. hotdog at index 196:
+
+```bash
+modal run modal/app.py --experiment all --qual-only \
+  --image-index-mode fixed --image-index 196 --qual-force
+```
+
+## Result layout on volume
+
+```
+/resnet50/          # Class B/C at top level; Class A under seed42/
+/vit/
+/mechanistic/
+/diagnostics/       # optional manifest
+```
+
+Class A parallel runs: `results/<arch>/seed42/{method}_*.npy`.  
+Class B/C: `results/<arch>/{method}_*.npy`.
+
+## Stale volume cleanup
 
 ```bash
 modal volume rm saliency-results /resnet50 --recursive
@@ -109,8 +100,8 @@ modal volume rm saliency-results /vit --recursive
 modal volume rm saliency-results /mechanistic --recursive
 ```
 
-Older volumes or local folders may contain `dinov2` or removed-method artifacts (`smoothgrad`, `gbp_gc`, `rollout`, `dino_attn`). Archive or delete them before final reporting; this cleanup does not delete result artifacts automatically.
+Archive local `dinov2/` or old method folders before reporting.
 
-## Cost Notes
+## Cost
 
-Start with `--num-images 10`. Full cascade runs are GPU-heavy; `--parallel-methods` reduces wall-clock time but increases peak GPU concurrency. Occlusion is also expensive because each image requires 30 forward passes per method (Binder A.1 default).
+Always smoke-test `--num-images 10` first. Full 500×methods cascade + 30-step occlusion is expensive; `--parallel-methods` trades cost for wall time.
