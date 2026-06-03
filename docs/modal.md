@@ -63,6 +63,7 @@ Downloads `resnet50/`, `vit/`, `mechanistic/` only (not stale `dinov2/`).
 | `--target-mode` | `dynamic` | Cascade explanation class |
 | `--seeds` | `42` | Class A can use `42,1,2` → `seed42/` subdirs |
 | `--occlusion-arch` | `all` | `resnet50` \| `vit` \| `all` |
+| `--occlusion-patch-fractions` | `0.10,0.20,0.30` | Comma-separated fractions of 196 arch-native tiles |
 | `--image-index` | `0` | With `--qual-only --image-index-mode fixed` |
 | `--qual-force` | false | Overwrite `qual_bundle.npz` |
 
@@ -104,4 +105,4 @@ Archive local `dinov2/` or old method folders before reporting.
 
 ## Cost
 
-Always smoke-test `--num-images 10` first. Full 500×methods cascade + 30-step occlusion is expensive; `--parallel-methods` trades cost for wall time.
+Always smoke-test `--num-images 10` first. Full 500×methods cascade + occlusion at three patch fractions is expensive; `--parallel-methods` trades cost for wall time.

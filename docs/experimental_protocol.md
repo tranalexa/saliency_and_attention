@@ -33,8 +33,8 @@ Operational checklist for cascade + occlusion on ResNet-50 and ViT-B/16.
 ## Occlusion
 
 1. Cascade baselines exist (`baseline_{method}.npz`).
-2. Box blur 15×15, top-30 patches, fixed step-0 target.
-3. Outputs: `occlusion_{method}_curve.npy`, `_auc.npy`, `occlusion_config.json` with `"blur_type": "box"`.
+2. Arch-native grids (196 tiles): ResNet 15×15 blur 15; ViT 16×16 blur 16. Top `round(fraction×196)` tiles at fractions 0.10, 0.20, 0.30; fixed step-0 target.
+3. Outputs: `occlusion_{method}_curve_fracXXX.npy`, `_auc_fracXXX.npy`, `occlusion_auc_summary.csv`, `occlusion_config.json` with `"blur_type": "box"`.
 
 **Verify:** `ground_truth_indices.npy`, `correctly_classified.npy` present (from cascade).
 

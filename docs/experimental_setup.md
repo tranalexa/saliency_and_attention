@@ -67,9 +67,11 @@ Curve summaries: `{method}_curve_stats.json`, `{method}_sensitivity_ratio.json` 
 
 Requires cascade baselines first. Does **not** recompute attributions in the deletion loop.
 
-- 15×15 patches, top **30** by |saliency|, **box blur** kernel 15 (Binder A.1 default).
+- **Arch-native 196-tile grids:** ResNet-50 uses 14×14 non-overlapping 15×15 tiles (box blur 15); ViT-B/16 uses native 14×14 tokens as 16×16 pixel patches (box blur 16).
+- **Patch fraction:** occlude top `round(patch_fraction × 196)` tiles by mean |saliency| (default fractions 0.10, 0.20, 0.30).
 - Target class = step-0 argmax, fixed for all steps.
-- AUC = mean softmax over steps 1–30 (lower = more faithful).
+- AUC = mean softmax over occlusion steps 1–N (lower = more faithful).
+- Artifacts: `occlusion_{method}_curve_fracXXX.npy`, `_auc_fracXXX.npy`, `occlusion_auc_summary.csv`.
 
 **Isolation:** Occlusion mutates working copies only; cascade/qual always use `_attribution_batch` clones.
 
@@ -91,7 +93,8 @@ Used for logit-correlation bands in analysis plots and \(D_{\text{arch}}\) in se
 | `within_arch_{arch}_spearman.png` | `{method}_spearman_*_mean.npy` (alias-aware) |
 | `class_b_spatial_attribution_within_arch.png` | GradCAM / transformer_gradcam |
 | ViT rollout + entropy panel | `attention_rollout` curve + `*_entropy_depth*.npy` |
-| `occlusion_faithfulness_curves.png` | `occlusion_{method}_curve.npy` |
+| `occlusion_faithfulness_curves.png` | `occlusion_{method}_curve_frac020.npy` (20% default plot) |
+| `occlusion_auc_by_fraction.png` | `occlusion_auc_summary.csv` |
 | Sensitivity-ratio LaTeX table | `*_curve_stats.json` (Class A, B, C) |
 
 Attention-rollout qual rows use **shared row-wise display scaling** so depth differences are visible (per-panel minmax was misleading).

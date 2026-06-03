@@ -1,9 +1,11 @@
 """Shared experiment logic for cascading sanity checks (notebooks + Modal)."""
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Literal, Sequence, Tuple
 
@@ -1153,9 +1155,115 @@ def run_cascading_experiment(
             )
 
 
-NUM_PATCHES_BINDER = 30  # Binder et al. Section A.1
-PATCH_SIZE_BINDER = 15  # Binder et al. Section A.1 main results
+PATCH_SIZE_BINDER = 15  # Binder et al. Section A.1 main results (ResNet tile size)
 PATCH_SIZE_BINDER_ALT = 8  # Binder appendix robustness check
+VIT_GRID_SIZE = 14
+RESNET_OCCLUSION_GRID_SIZE = 14
+DEFAULT_PATCH_FRACTIONS = (0.10, 0.20, 0.30)
+ARCH_DISPLAY_NAMES = {"resnet50": "ResNet-50", "vit": "ViT-B/16"}
+# Binder et al. Section A.1 used top-30 patches; ~30/196 ≈ 0.15 under the 196-tile protocol.
+BINDER_REFERENCE_PATCHES = 30
+
+
+@dataclass(frozen=True)
+class OcclusionGridSpec:
+    """Architecture-native spatial units for blurred-patch occlusion."""
+
+    arch: str
+    patch_slices: tuple[tuple[slice, slice], ...]
+    n_tiles: int
+    grid_size: int
+    patch_pixel_size: int
+    blur_kernel_size: int
+    grid_type: str
+
+
+def build_occlusion_grid(arch: str, image_size: int = 224) -> OcclusionGridSpec:
+    """Return patch slices and blur settings for arch-native occlusion grids."""
+    if arch == "resnet50":
+        patch_size = PATCH_SIZE_BINDER
+        grid_size = RESNET_OCCLUSION_GRID_SIZE
+        patch_slices = [
+            (
+                slice(y, y + patch_size),
+                slice(x, x + patch_size),
+            )
+            for y in range(0, grid_size * patch_size, patch_size)
+            for x in range(0, grid_size * patch_size, patch_size)
+        ]
+        return OcclusionGridSpec(
+            arch=arch,
+            patch_slices=tuple(patch_slices),
+            n_tiles=len(patch_slices),
+            grid_size=grid_size,
+            patch_pixel_size=patch_size,
+            blur_kernel_size=patch_size,
+            grid_type="resnet15",
+        )
+    if arch == "vit":
+        grid_size = VIT_GRID_SIZE
+        patch_px = image_size // grid_size
+        patch_slices = [
+            (
+                slice(y, y + patch_px),
+                slice(x, x + patch_px),
+            )
+            for y in range(0, grid_size * patch_px, patch_px)
+            for x in range(0, grid_size * patch_px, patch_px)
+        ]
+        return OcclusionGridSpec(
+            arch=arch,
+            patch_slices=tuple(patch_slices),
+            n_tiles=len(patch_slices),
+            grid_size=grid_size,
+            patch_pixel_size=patch_px,
+            blur_kernel_size=patch_px,
+            grid_type="vit_native",
+        )
+    raise ValueError("Unknown arch for occlusion grid: %s (use resnet50|vit)" % arch)
+
+
+def saliency_to_occlusion_scores(
+    saliency_map: np.ndarray,
+    arch: str,
+    image_size: int = 224,
+) -> np.ndarray:
+    """Per-tile mean |saliency| scores for ranking (shape n_tiles,)."""
+    grid = build_occlusion_grid(arch, image_size=image_size)
+    saliency = np.asarray(saliency_map, dtype=np.float64)
+    if arch == "resnet50":
+        scores = [
+            float(np.abs(saliency[ys, xs]).mean()) for ys, xs in grid.patch_slices
+        ]
+        return np.asarray(scores, dtype=np.float64)
+    if arch == "vit":
+        patch_px = grid.patch_pixel_size
+        gs = grid.grid_size
+        cropped = saliency[: gs * patch_px, : gs * patch_px]
+        blocks = cropped.reshape(gs, patch_px, gs, patch_px)
+        return np.abs(blocks).mean(axis=(1, 3)).ravel()
+    raise ValueError("Unknown arch for occlusion scores: %s" % arch)
+
+
+def rank_occlusion_patches(
+    saliency_map: np.ndarray,
+    arch: str,
+    image_size: int = 224,
+) -> list[tuple[slice, slice]]:
+    """Rank arch-native tiles by mean |saliency| (highest first)."""
+    grid = build_occlusion_grid(arch, image_size=image_size)
+    scores = saliency_to_occlusion_scores(saliency_map, arch, image_size=image_size)
+    order = np.argsort(scores)[::-1]
+    return [grid.patch_slices[int(i)] for i in order]
+
+
+def _occlusion_fraction_suffix(patch_fraction: float) -> str:
+    pct = int(round(patch_fraction * 100))
+    return "_frac%03d" % pct
+
+
+def effective_occlusion_count(patch_fraction: float, n_tiles: int) -> int:
+    return max(1, round(patch_fraction * n_tiles))
 
 
 def normalize_images(tensor: torch.Tensor) -> torch.Tensor:
@@ -1294,10 +1402,6 @@ def _blurred_deletion_curve(
     return confidences, confidences[1:]
 
 
-def _occlusion_output_suffix(num_patches: int, n_grid: int) -> str:
-    return "_full" if num_patches >= n_grid else ""
-
-
 def run_blurred_occlusion_faithfulness(
     model: nn.Module,
     all_images: torch.Tensor,
@@ -1306,29 +1410,26 @@ def run_blurred_occlusion_faithfulness(
     results_dir: Path,
     batch_size: int,
     device: str,
-    patch_size: int = PATCH_SIZE_BINDER,
-    stride: int | None = None,
-    num_patches: int = NUM_PATCHES_BINDER,
-    blur_kernel_size: int | None = None,
+    arch: str,
+    patch_fraction: float,
     blur_type: BlurType = "box",
     blur_sigma: float = 8.0,
+    blur_kernel_size: int | None = None,
     force_recompute: bool = False,
     seed: int = 42,
-) -> None:
-    """Run fixed-target blurred-patch deletion (Binder et al. Section A.1)."""
-    if stride is None:
-        stride = patch_size
+    image_size: int = 224,
+) -> dict[tuple[str, str, float], float]:
+    """Run fixed-target blurred-patch deletion on an arch-native grid."""
+    grid = build_occlusion_grid(arch, image_size=image_size)
     if blur_kernel_size is None:
-        blur_kernel_size = patch_size
+        blur_kernel_size = grid.blur_kernel_size
+    effective_patches = effective_occlusion_count(patch_fraction, grid.n_tiles)
+    fraction_suffix = _occlusion_fraction_suffix(patch_fraction)
 
     results_dir.mkdir(parents=True, exist_ok=True)
     images_snapshot = all_images.clone()
     clean_images = all_images.clone()
-    n_images, _channels, height, width = clean_images.shape
-    patch_slices = _patch_slices(height, width, patch_size, stride)
-    n_grid = len(patch_slices)
-    effective_patches = min(num_patches, n_grid)
-    output_suffix = _occlusion_output_suffix(effective_patches, n_grid)
+    n_images = clean_images.shape[0]
     blurred_images = make_blurred_inputs(
         clean_images.to(device),
         blur_kernel_size=blur_kernel_size,
@@ -1336,13 +1437,17 @@ def run_blurred_occlusion_faithfulness(
         blur_sigma=blur_sigma,
     ).cpu()
 
+    auc_results: dict[tuple[str, str, float], float] = {}
+
     for method in methods:
         curve_path = results_dir / (
-            "occlusion_%s_curve%s.npy" % (method, output_suffix)
+            "occlusion_%s_curve%s.npy" % (method, fraction_suffix)
         )
-        auc_path = results_dir / ("occlusion_%s_auc%s.npy" % (method, output_suffix))
+        auc_path = results_dir / ("occlusion_%s_auc%s.npy" % (method, fraction_suffix))
         if curve_path.exists() and auc_path.exists() and not force_recompute:
-            print("Skip occlusion", method)
+            print("Skip occlusion", method, fraction_suffix)
+            aucs = np.load(auc_path)
+            auc_results[(arch, method, patch_fraction)] = float(np.nanmean(aucs))
             continue
 
         saliency_maps = load_baseline_maps(
@@ -1352,22 +1457,38 @@ def run_blurred_occlusion_faithfulness(
         aucs = np.full(n_images, np.nan, dtype=np.float64)
         method_bs = _method_batch_size(method, batch_size)
 
-        for i in tqdm(range(n_images), desc="occlusion " + method):
+        for i in tqdm(
+            range(n_images),
+            desc="occlusion %s %s" % (method, fraction_suffix),
+        ):
             target_class = int(all_targets[i].item())
-            ranked = _rank_patches_by_saliency(saliency_maps[i], patch_slices)
+            ranked = rank_occlusion_patches(saliency_maps[i], arch, image_size)
             if i == 0:
-                patch_min, patch_max, patch_std = _patch_score_stats(
-                    saliency_maps[i], patch_slices
+                scores = saliency_to_occlusion_scores(
+                    saliency_maps[i], arch, image_size
+                )
+                patch_min, patch_max, patch_std = (
+                    float(scores.min()),
+                    float(scores.max()),
+                    float(scores.std()),
                 )
                 original_std = float(denormalize(clean_images[i : i + 1]).std().item())
                 blurred_std = float(denormalize(blurred_images[i : i + 1]).std().item())
                 print(
-                    "occlusion %s image0 patch_score min/max/std: %.6g %.6g %.6g"
-                    % (method, patch_min, patch_max, patch_std)
+                    "occlusion %s %s image0 patch_score min/max/std: %.6g %.6g %.6g"
+                    % (method, fraction_suffix, patch_min, patch_max, patch_std)
                 )
                 print(
-                    "occlusion %s image0 original_std=%.6g blurred_std=%.6g fixed_target=%d"
-                    % (method, original_std, blurred_std, target_class)
+                    "occlusion %s %s image0 original_std=%.6g blurred_std=%.6g "
+                    "fixed_target=%d n_occluded=%d"
+                    % (
+                        method,
+                        fraction_suffix,
+                        original_std,
+                        blurred_std,
+                        target_class,
+                        effective_patches,
+                    )
                 )
                 if blurred_std >= original_std:
                     logging.warning(
@@ -1398,16 +1519,17 @@ def run_blurred_occlusion_faithfulness(
 
         np.save(curve_path, curves)
         np.save(auc_path, aucs)
-        if not output_suffix:
-            np.save(
-                results_dir / ("occlusion_%s_auc_mean.npy" % method),
-                np.nanmean(aucs),
-            )
+        mean_auc = float(np.nanmean(aucs))
+        auc_results[(arch, method, patch_fraction)] = mean_auc
 
     occlusion_config = {
-        "patch_size": patch_size,
-        "stride": stride,
-        "num_patches": effective_patches,
+        "arch": arch,
+        "patch_fraction": patch_fraction,
+        "n_tiles": grid.n_tiles,
+        "effective_patches": effective_patches,
+        "grid_type": grid.grid_type,
+        "grid_size": grid.grid_size,
+        "patch_pixel_size": grid.patch_pixel_size,
         "blur_kernel_size": blur_kernel_size,
         "blur_type": blur_type,
         "target_policy": "fixed_step0_target",
@@ -1418,8 +1540,64 @@ def run_blurred_occlusion_faithfulness(
     }
     if blur_type == "gaussian":
         occlusion_config["blur_sigma"] = blur_sigma
-    with open(results_dir / "occlusion_config.json", "w") as f:
+    config_path = results_dir / ("occlusion_config%s.json" % fraction_suffix)
+    with open(config_path, "w") as f:
         json.dump(occlusion_config, f, indent=2)
+
+    return auc_results
+
+
+def build_occlusion_summary_table(
+    results_dir: Path,
+    arch: str,
+    methods: Sequence[str],
+    patch_fractions: Sequence[float],
+) -> list[dict]:
+    """Build per-method AUC summary rows for one architecture."""
+    grid = build_occlusion_grid(arch)
+    arch_title = ARCH_DISPLAY_NAMES.get(arch, arch)
+    rows: list[dict] = []
+    for patch_fraction in patch_fractions:
+        fraction_suffix = _occlusion_fraction_suffix(patch_fraction)
+        n_occluded = effective_occlusion_count(patch_fraction, grid.n_tiles)
+        for method in methods:
+            auc_path = find_method_result_path(
+                results_dir, method, "occlusion_%s_auc%s.npy" % ("%s", fraction_suffix)
+            )
+            if auc_path is None:
+                auc_path = results_dir / (
+                    "occlusion_%s_auc%s.npy" % (method, fraction_suffix)
+                )
+            if not auc_path.exists():
+                continue
+            auc = np.load(auc_path)
+            rows.append(
+                {
+                    "architecture": arch_title,
+                    "method": method,
+                    "patch_fraction": patch_fraction,
+                    "n_tiles": grid.n_tiles,
+                    "n_occluded": n_occluded,
+                    "n_images": int(len(auc)),
+                    "auc_mean": float(np.nanmean(auc)),
+                    "auc_std": float(np.nanstd(auc)),
+                    "auc_median": float(np.nanmedian(auc)),
+                }
+            )
+    return rows
+
+
+def save_occlusion_auc_summary_csv(results_dir: Path, rows: list[dict]) -> Path:
+    """Write occlusion_auc_summary.csv under results_dir."""
+    path = results_dir / "occlusion_auc_summary.csv"
+    if not rows:
+        return path
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
 
 
 run_occlusion = run_blurred_occlusion_faithfulness
@@ -2108,14 +2286,12 @@ def run_occlusion_pipeline(
     force_recompute: bool = False,
     seed: int = 42,
     ig_baseline: IgBaseline = "zero",
-    patch_size: int = PATCH_SIZE_BINDER,
-    stride: int | None = None,
-    num_patches: int = NUM_PATCHES_BINDER,
+    patch_fractions: Sequence[float] = DEFAULT_PATCH_FRACTIONS,
     blur_kernel_size: int | None = None,
     blur_type: BlurType = "box",
     blur_sigma: float = 8.0,
     subset_order: SubsetOrder = "sorted",
-) -> None:
+) -> tuple[dict[tuple[str, str, float], float], list[dict]]:
     """Run the blurred-occlusion faithfulness axis for one scoped architecture."""
     if arch not in ARCH_SALIENCY_METHODS:
         raise ValueError("Unknown arch: %s (use resnet50|vit)" % arch)
@@ -2165,23 +2341,53 @@ def run_occlusion_pipeline(
         gt_labels=gt_labels,
         subset_order=subset_order,
     )
-    run_blurred_occlusion_faithfulness(
-        model,
-        all_images,
-        all_targets,
-        methods,
-        results_dir,
-        batch_size,
-        device,
-        patch_size=patch_size,
-        stride=stride,
-        num_patches=num_patches,
-        blur_kernel_size=blur_kernel_size,
-        blur_type=blur_type,
-        blur_sigma=blur_sigma,
-        force_recompute=force_recompute,
-        seed=seed,
+
+    auc_results: dict[tuple[str, str, float], float] = {}
+    for patch_fraction in patch_fractions:
+        fraction_results = run_blurred_occlusion_faithfulness(
+            model,
+            all_images,
+            all_targets,
+            methods,
+            results_dir,
+            batch_size,
+            device,
+            arch=arch,
+            patch_fraction=float(patch_fraction),
+            blur_kernel_size=blur_kernel_size,
+            blur_type=blur_type,
+            blur_sigma=blur_sigma,
+            force_recompute=force_recompute,
+            seed=seed,
+            image_size=image_size,
+        )
+        auc_results.update(fraction_results)
+
+    summary_rows = build_occlusion_summary_table(
+        results_dir, arch, methods, patch_fractions
     )
+    save_occlusion_auc_summary_csv(results_dir, summary_rows)
+
+    grid = build_occlusion_grid(arch, image_size)
+    master_config = {
+        "arch": arch,
+        "patch_fractions": [float(f) for f in patch_fractions],
+        "grid": {
+            "n_tiles": grid.n_tiles,
+            "grid_type": grid.grid_type,
+            "grid_size": grid.grid_size,
+            "patch_pixel_size": grid.patch_pixel_size,
+            "blur_kernel_size": blur_kernel_size or grid.blur_kernel_size,
+        },
+        "blur_type": blur_type,
+        "methods": list(methods),
+    }
+    if blur_type == "gaussian":
+        master_config["blur_sigma"] = blur_sigma
+    with open(results_dir / "occlusion_config.json", "w") as f:
+        json.dump(master_config, f, indent=2)
+
+    return auc_results, summary_rows
 
 
 def run_mechanistic_pipeline(

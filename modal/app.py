@@ -362,8 +362,7 @@ def run_occlusion(
     seed: int = 42,
     ig_baseline: str = "zero",
     ig_steps: int = 50,
-    occlusion_patches: int = 30,
-    occlusion_patch_size: int = 15,
+    occlusion_patch_fractions: str = "0.10,0.20,0.30",
     blur_type: str = "box",
     blur_sigma: float = 8.0,
 ):
@@ -372,6 +371,7 @@ def run_occlusion(
     sys.path.insert(0, "/root/src")
     from experiment_utils import run_occlusion_pipeline
 
+    patch_fractions = [float(x.strip()) for x in occlusion_patch_fractions.split(",") if x.strip()]
     run_occlusion_pipeline(
         arch=arch,
         imagenet_root=Path(IMAGENET_MOUNT),
@@ -383,8 +383,7 @@ def run_occlusion(
         seed=seed,
         ig_baseline=ig_baseline,
         ig_steps=ig_steps,
-        patch_size=occlusion_patch_size,
-        num_patches=occlusion_patches,
+        patch_fractions=patch_fractions,
         blur_type=blur_type,
         blur_sigma=blur_sigma,
     )
@@ -480,8 +479,7 @@ def _launch_occlusion(
     ig_baseline: str,
     ig_steps: int,
     occlusion_arch: str,
-    occlusion_patches: int,
-    occlusion_patch_size: int,
+    occlusion_patch_fractions: str,
     blur_type: str,
     blur_sigma: float,
 ) -> list:
@@ -495,8 +493,7 @@ def _launch_occlusion(
             seed=primary_seed,
             ig_baseline=ig_baseline,
             ig_steps=ig_steps,
-            occlusion_patches=occlusion_patches,
-            occlusion_patch_size=occlusion_patch_size,
+            occlusion_patch_fractions=occlusion_patch_fractions,
             blur_type=blur_type,
             blur_sigma=blur_sigma,
         )
@@ -550,8 +547,7 @@ def main(
     ig_baseline: str = "zero",
     ig_steps: int = 50,
     occlusion_arch: str = "all",
-    occlusion_patches: int = 30,
-    occlusion_patch_size: int = 15,
+    occlusion_patch_fractions: str = "0.10,0.20,0.30",
     blur_type: str = "box",
     blur_sigma: float = 8.0,
 ):
@@ -568,8 +564,7 @@ def main(
     ig_baseline: zero | mean (Integrated Gradients baseline)
     ig_steps: Integrated Gradients interpolation steps
     occlusion_arch: resnet50 | vit | all
-    occlusion_patches: top-K patches to occlude (30 = Binder A.1; use full grid for extended)
-    occlusion_patch_size: patch and blur kernel size (15 = Binder main; 8 = appendix)
+    occlusion_patch_fractions: comma-separated fractions of 196 arch-native tiles (default 0.10,0.20,0.30)
     blur_type: box (Binder default) | gaussian (legacy ablation)
     blur_sigma: Gaussian sigma only; ignored when blur_type=box
     """
@@ -625,8 +620,7 @@ def main(
             ig_baseline,
             ig_steps,
             occlusion_arch,
-            occlusion_patches,
-            occlusion_patch_size,
+            occlusion_patch_fractions,
             blur_type,
             blur_sigma,
         )
@@ -754,8 +748,7 @@ def main(
             ig_baseline,
             ig_steps,
             occlusion_arch,
-            occlusion_patches,
-            occlusion_patch_size,
+            occlusion_patch_fractions,
             blur_type,
             blur_sigma,
         )
