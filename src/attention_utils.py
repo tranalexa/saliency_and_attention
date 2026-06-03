@@ -1,4 +1,4 @@
-"""ViT attention-based explanation maps (raw attention only)."""
+"""ViT attention-based explanation maps (Abnar attention rollout, etc.)."""
 from __future__ import annotations
 
 import re
@@ -61,23 +61,23 @@ def _make_capture_hook(storage: list):
     return hook
 
 
-def validate_raw_attn_tensor(attn_weights: torch.Tensor, name: str = "") -> None:
+def validate_attention_weight_tensor(attn_weights: torch.Tensor, name: str = "") -> None:
     """
-    Validate that captured attention weights are post-softmax probabilities.
+    Validate that captured per-layer attention weights are post-softmax probabilities.
 
     Expected shape: (batch, num_heads, num_tokens, num_tokens). Each attention
     row should be non-negative and sum to ~1.0.
     """
     if attn_weights.dim() != 4:
         raise ValueError(
-            "Raw attention tensor %s has shape %s, expected (batch, heads, tokens, tokens)."
+            "Attention weight tensor %s has shape %s, expected (batch, heads, tokens, tokens)."
             % (name, tuple(attn_weights.shape))
         )
     row_sums = attn_weights.sum(dim=-1)
     mean_sum = row_sums.mean().item()
     if abs(mean_sum - 1.0) > 0.05:
         raise ValueError(
-            "Raw attention tensor %s row sums to %.4f, expected ~1.0. You are likely "
+            "Attention weight tensor %s row sums to %.4f, expected ~1.0. You are likely "
             "hooking the wrong submodule and capturing pre-softmax logits or value "
             "projections. The hook should be on block.attn at the point after softmax "
             "is applied to the QK product."
@@ -85,13 +85,16 @@ def validate_raw_attn_tensor(attn_weights: torch.Tensor, name: str = "") -> None
         )
     if (attn_weights < -1e-6).any():
         raise ValueError(
-            "Raw attention tensor %s contains negative values. Post-softmax attention "
+            "Attention weight tensor %s contains negative values. Post-softmax attention "
             "weights must be non-negative." % name
         )
 
 
-def validate_raw_attention(model: nn.Module, input_tensor: torch.Tensor, name: str = "") -> None:
-    """Run one forward pass and validate the last-block raw attention tensor."""
+def validate_attention_rollout(model: nn.Module, input_tensor: torch.Tensor, name: str = "") -> None:
+    """Validate post-softmax attention capture on the last block (hook sanity check).
+
+    Full ``get_attention_rollout`` uses all blocks; this check stays fast at startup.
+    """
     attn_modules = _get_attn_modules(model)
     if not attn_modules:
         raise ValueError("No attention modules found in model.")
@@ -105,11 +108,13 @@ def validate_raw_attention(model: nn.Module, input_tensor: torch.Tensor, name: s
     finally:
         handle.remove()
     if not captured:
-        raise ValueError("Raw attention tensor %s was not captured." % (name or module_name))
-    validate_raw_attn_tensor(captured[0], name=name or module_name)
+        raise ValueError(
+            "Attention weight tensor %s was not captured." % (name or module_name)
+        )
+    validate_attention_weight_tensor(captured[0], name=name or module_name)
 
 
-_RAW_ATTENTION_SIGNAL_THRESHOLD = 1e-6
+_ATTENTION_ROLLOUT_SIGNAL_THRESHOLD = 1e-6
 
 
 def _cls_to_spatial_map(
@@ -125,7 +130,7 @@ def _cls_to_spatial_map(
     if n_patches != expected:
         grid_size = int(np.sqrt(n_patches))
     heatmap = cls_weights.reshape(grid_size, grid_size)
-    if np.abs(heatmap).max() < _RAW_ATTENTION_SIGNAL_THRESHOLD:
+    if np.abs(heatmap).max() < _ATTENTION_ROLLOUT_SIGNAL_THRESHOLD:
         return np.full((out_size, out_size), 0.5)
     heatmap_t = torch.from_numpy(heatmap).float()[None, None, ...]
     upsampled = F.interpolate(
@@ -163,7 +168,27 @@ def _cls_per_head_spatial_maps(
     )
 
 
-def get_raw_attention(
+def _attention_rollout(layer_attns: List[torch.Tensor]) -> torch.Tensor:
+    """
+    Abnar & Zuidema (ACL 2020) attention rollout, Equation 1.
+
+    Per layer: head-mean, 0.5*Watt + 0.5*I, row-normalize, then Ã_i = A_i @ Ã_{i-1}.
+    """
+    attn_bar = None
+    for attn in layer_attns:
+        validate_attention_weight_tensor(attn, name="attention_rollout")
+        b, n = attn.shape[0], attn.shape[-1]
+        watt = attn.mean(dim=1)
+        eye = torch.eye(n, device=watt.device, dtype=watt.dtype).expand(b, n, n)
+        a = 0.5 * watt + 0.5 * eye
+        a = a / a.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        attn_bar = a if attn_bar is None else a @ attn_bar
+    if attn_bar is None:
+        raise ValueError("No attention layers captured for rollout.")
+    return attn_bar
+
+
+def get_attention_rollout(
     model: nn.Module,
     input_tensor: torch.Tensor,
     grid_size: int | None = None,
@@ -174,45 +199,52 @@ def get_raw_attention(
     head_aggregation: str = "auto",
 ) -> np.ndarray | tuple[np.ndarray, float] | tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, float, np.ndarray]:
     """
-    Raw attention from last block: average heads, CLS -> patches, spatial map.
+    Abnar & Zuidema (ACL 2020) attention rollout over all ViT blocks (Eq. 1).
 
-    Returns HxW numpy array. If return_entropy=True, also returns mean entropy.
+    Hooks every block, chains layer attention with residual identity and row-normalization,
+    then maps CLS-to-patch rollout weights to a spatial heatmap.
+
+    ``head_aggregation`` does not affect the main rollout map. ``return_entropy`` and
+    ``return_per_head`` still use the last block only (pipeline compatibility).
     """
     attn_modules = _get_attn_modules(model)
     if not attn_modules:
         raise ValueError("No attention modules found in model.")
-    _, last_module = attn_modules[-1]
-    captured: List[torch.Tensor] = []
-    handle = last_module.register_forward_hook(_make_capture_hook(captured))
-    model.eval()
-    with torch.no_grad():
-        model(input_tensor)
-    handle.remove()
+    blocks = getattr(model, "blocks", None)
+    if blocks is None:
+        raise ValueError("Expected a timm ViT with model.blocks.")
 
-    if not captured:
-        raise ValueError("Raw attention tensor was not captured.")
-    attn = captured[0]
-    validate_raw_attn_tensor(attn, name="raw_attn")
-    cls_by_head = attn[0, :, 0, 1:].detach().cpu().numpy()
+    captured: List[torch.Tensor] = []
+    handles = [
+        module.register_forward_hook(_make_capture_hook(captured))
+        for _, module in attn_modules
+    ]
+    model.eval()
+    try:
+        with torch.no_grad():
+            model(input_tensor)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    if len(captured) != len(blocks):
+        raise ValueError(
+            "Expected %d attention captures for rollout, got %d."
+            % (len(blocks), len(captured))
+        )
+
+    last_attn = captured[-1]
+    attn_bar = _attention_rollout(captured)
+    cls_weights = attn_bar[0, 0, 1:].detach().cpu().numpy()
     if grid_size is None:
-        grid_size = int(np.sqrt(cls_by_head.shape[1]))
+        grid_size = int(np.sqrt(cls_weights.shape[0]))
     per_head = _cls_per_head_spatial_maps(
-        attn, grid_size, out_size=out_size, apply_rms_norm=apply_rms_norm
+        last_attn, grid_size, out_size=out_size, apply_rms_norm=apply_rms_norm
     )
-    if head_aggregation == "mean":
-        cls_weights = cls_by_head.mean(axis=0)
-    elif head_aggregation == "max":
-        cls_weights = cls_by_head.max(axis=0)
-    elif head_aggregation == "auto":
-        mean_weights = cls_by_head.mean(axis=0)
-        max_weights = cls_by_head.max(axis=0)
-        cls_weights = max_weights if np.std(mean_weights) < 1e-6 and np.std(max_weights) > 1e-6 else mean_weights
-    else:
-        raise ValueError("head_aggregation must be 'mean', 'max', or 'auto'")
     spatial_map = _cls_to_spatial_map(
         cls_weights, grid_size, out_size, apply_rms_norm=apply_rms_norm
     )
-    entropy = compute_attention_entropy(attn)
+    entropy = compute_attention_entropy(last_attn)
     if return_entropy and return_per_head:
         return spatial_map, entropy, per_head
     if return_entropy:

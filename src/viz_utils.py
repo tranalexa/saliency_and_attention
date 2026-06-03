@@ -19,7 +19,7 @@ METHOD_DISPLAY_NAMES = {
     "gradcam": "GradCAM",
     "transformer_gradcam": "Transformer\nGradCAM",
     "gbp": "Guided\nBackProp",
-    "raw_attn": "Raw\nAttention",
+    "attention_rollout": "Attention\nRollout",
 }
 
 # Default: one colormap for every method (fair cross-method comparison).
@@ -73,7 +73,7 @@ METHOD_CASCADE_CMAP_ADEBAYO_LEGACY = {
     "ig": "bwr",
     "gradcam": "hot",
     "transformer_gradcam": "hot",
-    "raw_attn": "gray",
+    "attention_rollout": "gray",
 }
 
 
@@ -242,9 +242,12 @@ def add_logit_corr_band(
     return twin
 
 
-def load_raw_attention_entropy(results_dir: Union[str, Path]) -> np.ndarray | None:
-    """Load per-depth raw attention entropy means if present."""
-    paths = sorted(Path(results_dir).glob("raw_attn_entropy_depth*.npy"))
+def load_attention_rollout_entropy(results_dir: Union[str, Path]) -> np.ndarray | None:
+    """Load per-depth last-block attention entropy means (rollout diagnostic)."""
+    root = Path(results_dir)
+    paths = sorted(root.glob("attention_rollout_entropy_depth*.npy"))
+    if not paths:
+        paths = sorted(root.glob("raw_attn_entropy_depth*.npy"))
     if not paths:
         return None
     vals = []
@@ -254,15 +257,15 @@ def load_raw_attention_entropy(results_dir: Union[str, Path]) -> np.ndarray | No
     return np.array(vals, dtype=np.float64)
 
 
-def add_attention_entropy_overlay(
+def add_attention_rollout_entropy_overlay(
     ax: plt.Axes,
     results_dir: Union[str, Path],
     *,
     num_patches: int = 196,
     x_values: Sequence[float] | None = None,
 ) -> plt.Axes | None:
-    """Overlay raw-attention entropy and shade near-uniform collapse regions."""
-    entropy = load_raw_attention_entropy(results_dir)
+    """Overlay last-block attention entropy and shade near-uniform collapse regions."""
+    entropy = load_attention_rollout_entropy(results_dir)
     if entropy is None:
         return None
     x = np.asarray(x_values if x_values is not None else np.arange(len(entropy)))
@@ -273,7 +276,9 @@ def add_attention_entropy_overlay(
     x = x[:n]
     threshold = 0.8 * np.log(num_patches)
     twin = ax.twinx()
-    twin.plot(x, entropy, color="tab:red", linewidth=1.0, label="raw attention entropy")
+    twin.plot(
+        x, entropy, color="tab:red", linewidth=1.0, label="last-block attention entropy"
+    )
     twin.set_ylabel("attention entropy", color="tab:red", fontsize=8)
     twin.tick_params(axis="y", labelsize=7, colors="tab:red")
     collapsed = entropy > threshold
@@ -349,6 +354,9 @@ def short_layer_label(name: str, max_len: int = 9) -> str:
 _FLAT_MAP_STD_THRESH = 1e-4
 _FLAT_MAP_RANGE_THRESH = 0.02
 
+# ViT cascade randomizes head before blocks; row-shared scaling shows block-depth drift.
+_ROW_SHARED_DISPLAY_METHODS = frozenset({"attention_rollout", "raw_attn"})
+
 
 def prepare_map_for_display(
     map_2d: np.ndarray,
@@ -364,7 +372,7 @@ def prepare_map_for_display(
       - ``minmax``: stretch |x| to [0, 1] (default; matches pre-33413b2 commit figures).
       - ``percentile``: clip to p-th percentile then scale to [0, 1] (sparse ViT maps).
       - ``absmax``: |x| / max(|x|) (strict Adebayo abs-max).
-    Near-uniform maps render as flat_value (avoids saturated raw-attn panels).
+    Near-uniform maps render as flat_value (avoids saturated rollout panels).
     """
     m = np.asarray(map_2d, dtype=np.float64)
     if m.size == 0:
@@ -385,6 +393,35 @@ def prepare_map_for_display(
     raise ValueError(
         "display_norm must be 'minmax', 'percentile', or 'absmax', got %s" % display_norm
     )
+
+
+def prepare_cascade_row_for_display(
+    maps: Sequence[np.ndarray],
+    *,
+    display_norm: str = "minmax",
+    percentile: float = 99.0,
+    flat_value: float = 0.5,
+) -> list[np.ndarray]:
+    """Normalize a cascade row with one scale so depth-to-depth differences stay visible."""
+    stack = [np.asarray(m, dtype=np.float64) for m in maps]
+    if not stack:
+        return []
+    if display_norm == "minmax":
+        abs_stack = [np.abs(m) for m in stack]
+        lo = min(m.min() for m in abs_stack)
+        hi = max(m.max() for m in abs_stack)
+        if hi <= lo:
+            return [np.zeros_like(m) for m in stack]
+        return [(m - lo) / (hi - lo) for m in abs_stack]
+    return [
+        prepare_map_for_display(
+            m,
+            display_norm=display_norm,
+            percentile=percentile,
+            flat_value=flat_value,
+        )
+        for m in stack
+    ]
 
 
 def cascade_colormap_for_method(
@@ -461,22 +498,36 @@ def _show_map_panel(
     if show_input_only or (overlay and saliency is None):
         ax.imshow(np.clip(rgb, 0, 1))
     elif overlay:
-        ax.imshow(
-            overlay_saliency_on_image(
-                rgb,
-                saliency,
-                alpha=overlay_alpha,
-                cmap=heatmap_cmap,
-                percentile=display_percentile,
+        if display_norm == "as_is":
+            heat = np.clip(np.asarray(saliency, dtype=np.float64), 0.0, 1.0)
+            colored = plt.get_cmap(heatmap_cmap)(heat)[:, :, :3]
+            blended = np.clip(
+                (1.0 - overlay_alpha) * np.clip(rgb, 0.0, 1.0) + overlay_alpha * colored,
+                0.0,
+                1.0,
             )
-        )
+            ax.imshow(blended)
+        else:
+            ax.imshow(
+                overlay_saliency_on_image(
+                    rgb,
+                    saliency,
+                    alpha=overlay_alpha,
+                    cmap=heatmap_cmap,
+                    percentile=display_percentile,
+                )
+            )
     else:
-        ax.imshow(
-            prepare_map_for_display(
+        if display_norm == "as_is":
+            disp = np.clip(np.asarray(saliency, dtype=np.float64), 0.0, 1.0)
+        else:
+            disp = prepare_map_for_display(
                 saliency,
                 display_norm=display_norm,
                 percentile=display_percentile,
-            ),
+            )
+        ax.imshow(
+            disp,
             vmin=0.0,
             vmax=1.0,
             cmap=mask_cmap,
@@ -509,7 +560,17 @@ def select_depth_indices(n_depths: int, max_cols: Optional[int] = None) -> List[
 
 def _ssim_metric_paths(results_dir: Path, method: str, seed: int = 42) -> list[Path]:
     """SSIM curves for Class A may live under ``seed{N}/`` after parallel Modal runs."""
-    names = [method, "ig", "gradient", "input_grad", "gradcam", "transformer_gradcam", "gbp"]
+    names = [
+        method,
+        "ig",
+        "gradient",
+        "input_grad",
+        "gradcam",
+        "transformer_gradcam",
+        "attention_rollout",
+        "raw_attn",
+        "gbp",
+    ]
     seen: set[str] = set()
     ordered: list[str] = []
     for name in names:
@@ -618,14 +679,22 @@ def plot_cascade_paper_grid(
     if not qual_path.exists():
         return None
     data = np.load(qual_path, allow_pickle=True)
+    from experiment_utils import qual_bundle_field
+
+    files = list(data.files)
     order = list(data["order"])
-    methods = [m for m in methods if ("baseline_" + m) in data.files and ("cascade_" + m) in data.files]
+    methods = [
+        m
+        for m in methods
+        if qual_bundle_field(m, "baseline", files)
+        and qual_bundle_field(m, "cascade", files)
+    ]
     if not methods:
         return None
 
     rgb = np.clip(np.asarray(data["image"], dtype=np.float64), 0.0, 1.0)
 
-    cascade0 = data["cascade_" + methods[0]]
+    cascade0 = data[qual_bundle_field(methods[0], "cascade", files)]
     n_depths = len(cascade0)
     if depth_indices is None:
         depth_indices = select_depth_indices(n_depths, max_cols=max_depth_cols)
@@ -673,18 +742,40 @@ def plot_cascade_paper_grid(
             linespacing=1.25,
             transform=ax_label.transAxes,
         )
-        cascade = data["cascade_" + method]
+        cascade_key = qual_bundle_field(method, "cascade", files)
+        baseline_key = qual_bundle_field(method, "baseline", files)
+        cascade = data[cascade_key]
         row_cmap = cascade_colormap_for_method(
             method, colormap_style=colormap_style, mask_cmap=mask_cmap
         )
+        row_shared = method in _ROW_SHARED_DISPLAY_METHODS and display_norm == "minmax"
+        row_display_maps = None
+        if row_shared:
+            row_maps = [data[baseline_key]] + [cascade[d] for d in depth_indices]
+            row_display_maps = prepare_cascade_row_for_display(
+                row_maps, display_norm=display_norm, percentile=display_percentile
+            )
         for j in range(ncols):
             ax = fig.add_subplot(gs[i, j + 1])
-            if j == 0:
+            if row_display_maps is not None:
+                sal = row_display_maps[j]
+                _show_map_panel(
+                    ax,
+                    rgb,
+                    sal,
+                    overlay=overlay,
+                    overlay_alpha=overlay_alpha,
+                    heatmap_cmap=heatmap_cmap,
+                    mask_cmap=row_cmap,
+                    display_percentile=display_percentile,
+                    display_norm="as_is",
+                )
+            elif j == 0:
                 # Normal Model = saliency from pretrained weights (not a plain photo).
                 _show_map_panel(
                     ax,
                     rgb,
-                    data["baseline_" + method],
+                    data[baseline_key],
                     overlay=overlay,
                     overlay_alpha=overlay_alpha,
                     heatmap_cmap=heatmap_cmap,
@@ -750,16 +841,28 @@ def plot_cascading_grid(
     if not qual_path.exists():
         return None
     data = np.load(qual_path, allow_pickle=True)
-    key = "cascade_" + method
-    if key not in data.files:
+    from experiment_utils import qual_bundle_field
+
+    files = list(data.files)
+    cascade_key = qual_bundle_field(method, "cascade", files)
+    baseline_key = qual_bundle_field(method, "baseline", files)
+    if cascade_key is None or baseline_key is None:
         return None
-    cascade = data[key]
+    cascade = data[cascade_key]
     order = list(data["order"])
     arch_family = resolve_arch_family(arch, order)
     rgb = np.clip(np.asarray(data["image"], dtype=np.float64), 0.0, 1.0)
     row_cmap = cascade_colormap_for_method(
         method, colormap_style=colormap_style, mask_cmap=mask_cmap
     )
+    row_shared = method in _ROW_SHARED_DISPLAY_METHODS and display_norm == "minmax"
+    strip_maps = None
+    if row_shared:
+        strip_maps = prepare_cascade_row_for_display(
+            [data[baseline_key], *list(cascade)],
+            display_norm=display_norm,
+            percentile=display_percentile,
+        )
     nrows = len(cascade) + 2
     fig = plt.figure(figsize=(4, 0.4 * nrows))
     gs = gridspec.GridSpec(nrows, 1)
@@ -771,13 +874,13 @@ def plot_cascading_grid(
     _show_map_panel(
         ax,
         rgb,
-        data["baseline_" + method],
+        strip_maps[0] if strip_maps is not None else data[baseline_key],
         overlay=overlay,
         overlay_alpha=overlay_alpha,
         heatmap_cmap=heatmap_cmap,
         mask_cmap=row_cmap,
         display_percentile=display_percentile,
-        display_norm=display_norm,
+        display_norm="as_is" if strip_maps is not None else display_norm,
     )
     ax.set_title("Baseline (no randomization)")
     ax.axis("off")
@@ -786,13 +889,13 @@ def plot_cascading_grid(
         _show_map_panel(
             ax,
             rgb,
-            m,
+            strip_maps[i + 1] if strip_maps is not None else m,
             overlay=overlay,
             overlay_alpha=overlay_alpha,
             heatmap_cmap=heatmap_cmap,
             mask_cmap=row_cmap,
             display_percentile=display_percentile,
-            display_norm=display_norm,
+            display_norm="as_is" if strip_maps is not None else display_norm,
         )
         if i == 0:
             label = "Pretrained (no randomization)"
@@ -940,7 +1043,12 @@ def plot_occlusion_faithfulness_curves(
             used_step0 = False
         plotted = 0
         for method in cfg["methods"]:
-            curve_path = results_root / arch / ("occlusion_%s_curve.npy" % method)
+            from experiment_utils import find_method_result_path
+
+            arch_dir = results_root / arch
+            curve_path = find_method_result_path(
+                arch_dir, method, "occlusion_%s_curve.npy"
+            ) or (arch_dir / ("occlusion_%s_curve.npy" % method))
             mean, std, has_step0 = _occlusion_mean_std_curve(curve_path, step0)
             if mean is None:
                 continue

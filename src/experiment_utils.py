@@ -18,8 +18,8 @@ from tqdm.auto import tqdm
 import timm
 
 from attention_utils import (
-    get_raw_attention,
-    validate_raw_attention,
+    get_attention_rollout,
+    validate_attention_rollout,
 )
 from metrics_utils import (
     abs_grayscale_norm,
@@ -63,8 +63,66 @@ METHODS_CLASS_B = {
 
 METHODS_CLASS_C = {
     "resnet50": ["gbp"],
-    "vit": ["raw_attn"],
+    "vit": ["attention_rollout"],
 }
+
+# Pre-rename artifacts on disk (e.g. baseline_raw_attn.npz, raw_attn_spearman_*.npy).
+METHOD_ARTIFACT_ALIASES: dict[str, tuple[str, ...]] = {
+    "attention_rollout": ("attention_rollout", "raw_attn"),
+}
+
+
+def method_artifact_stems(method: str) -> tuple[str, ...]:
+    """On-disk metric/baseline stems for a canonical method id (newest alias first)."""
+    return METHOD_ARTIFACT_ALIASES.get(method, (method,))
+
+
+def _method_artifact_stems(method: str) -> tuple[str, ...]:
+    return method_artifact_stems(method)
+
+
+def find_method_result_path(
+    results_dir: Path, method: str, pattern: str
+) -> Path | None:
+    """First existing path from ``pattern % stem`` for method aliases (one ``%s``)."""
+    for stem in method_artifact_stems(method):
+        path = results_dir / (pattern % stem)
+        if path.exists():
+            return path
+    return None
+
+
+def backfill_method_curve_stats(
+    results_dir: Path, arch: str, method: str
+) -> bool:
+    """Write ``{method}_curve_stats.json`` from saved primary Spearman means if missing."""
+    out_path = results_dir / ("%s_curve_stats.json" % method)
+    if out_path.exists():
+        return False
+    metric_path = find_method_result_path(
+        results_dir,
+        method,
+        "%s_spearman_abs_rms_mean.npy"
+        if PRIMARY_SPEARMAN_VARIANT.get(method) != "signed_rms"
+        else "%s_spearman_rms_mean.npy",
+    )
+    if metric_path is None:
+        return False
+    sim = np.load(metric_path)
+    logit_corr = _load_logit_corr(results_dir, arch)
+    _save_curve_characterization(
+        results_dir, method, arch, sim, len(sim), logit_corr
+    )
+    return True
+
+
+def qual_bundle_field(method: str, prefix: str, files: Sequence[str]) -> str | None:
+    """Resolve ``qual_bundle`` keys across method renames (e.g. ``baseline_raw_attn``)."""
+    for stem in _method_artifact_stems(method):
+        key = "%s_%s" % (prefix, stem)
+        if key in files:
+            return key
+    return None
 
 METHODS_REFERENCE = {
     "resnet50": [],
@@ -724,8 +782,8 @@ def load_all_images(
     return torch.cat(all_images), torch.cat(all_targets), torch.cat(all_gt_labels)
 
 
-def _method_baseline_path(results_dir: Path, method: str) -> Path:
-    return results_dir / ("baseline_%s.npz" % method)
+def _method_baseline_path(results_dir: Path, method: str, stem: str | None = None) -> Path:
+    return results_dir / ("baseline_%s.npz" % (stem or method))
 
 
 def _baseline_search_dirs(
@@ -744,15 +802,19 @@ def _method_baseline_exists(
     results_dir: Path, method: str, seed: int = 42
 ) -> bool:
     for directory in _baseline_search_dirs(results_dir, method, seed):
-        path = _method_baseline_path(directory, method)
-        if not path.exists():
-            legacy = directory / "baseline_maps.npz"
-            if legacy.exists() and ("baseline_" + method) in np.load(legacy).files:
+        for stem in _method_artifact_stems(method):
+            path = _method_baseline_path(directory, method, stem=stem)
+            if not path.exists():
+                continue
+            data = np.load(path)
+            if "baseline_map_raw" in data.files or "baseline_map" in data.files:
                 return True
-            continue
-        data = np.load(path)
-        if "baseline_map_raw" in data.files or "baseline_map" in data.files:
-            return True
+        legacy = directory / "baseline_maps.npz"
+        if legacy.exists():
+            data = np.load(legacy)
+            for stem in _method_artifact_stems(method):
+                if ("baseline_" + stem) in data.files:
+                    return True
     return False
 
 
@@ -766,30 +828,40 @@ def load_baseline_maps(
     else:
         key = "baseline_map_div"
     for directory in _baseline_search_dirs(results_dir, method, seed):
-        per_method = _method_baseline_path(directory, method)
-        if per_method.exists():
-            data = np.load(per_method)
-            if key in data.files:
-                return data[key]
-            if norm == "raw" and "baseline_map" in data.files:
-                return data["baseline_map"]
+        for stem in _method_artifact_stems(method):
+            per_method = _method_baseline_path(directory, method, stem=stem)
+            if per_method.exists():
+                data = np.load(per_method)
+                if key in data.files:
+                    return data[key]
+                if norm == "raw" and "baseline_map" in data.files:
+                    return data["baseline_map"]
         legacy = directory / "baseline_maps.npz"
         if legacy.exists():
             data = np.load(legacy)
-            legacy_key = "baseline_" + method
-            if legacy_key in data.files:
-                return data[legacy_key]
+            for stem in _method_artifact_stems(method):
+                legacy_key = "baseline_" + stem
+                if legacy_key in data.files:
+                    return data[legacy_key]
     raise FileNotFoundError(
         "Baseline maps for method %r (norm=%s) not found under %s (seed=%d)"
         % (method, norm, results_dir, seed)
     )
 
 
-def _primary_metric_file(method: str) -> str:
+def _primary_metric_file(method: str, stem: str | None = None) -> str:
+    name = stem or method
     variant = PRIMARY_SPEARMAN_VARIANT.get(method, "abs_rms")
     if variant == "signed_rms":
-        return "%s_spearman_rms.npy" % method
-    return "%s_spearman_abs_rms.npy" % method
+        return "%s_spearman_rms.npy" % name
+    return "%s_spearman_abs_rms.npy" % name
+
+
+def _method_metrics_cached(results_dir: Path, method: str) -> bool:
+    for stem in _method_artifact_stems(method):
+        if (results_dir / _primary_metric_file(method, stem=stem)).exists():
+            return True
+    return False
 
 
 def _load_logit_corr(results_dir: Path, arch: str) -> np.ndarray | None:
@@ -977,8 +1049,7 @@ def run_cascading_experiment(
     }
 
     for method in methods:
-        skip_path = results_dir / _primary_metric_file(method)
-        if skip_path.exists() and not force_recompute:
+        if _method_metrics_cached(results_dir, method) and not force_recompute:
             print("Skip", method)
             continue
         baseline_raw = load_baseline_maps(results_dir, method, norm="raw")
@@ -1012,14 +1083,14 @@ def run_cascading_experiment(
                 ]
                 zero_map_rates[depth] = float(np.mean(zero_flags))
 
-            if method == "raw_attn":
+            if method == "attention_rollout":
                 entropy_vals = []
                 for start in range(0, n_images, method_bs):
                     batch = _attribution_batch(
                         all_images[start : start + method_bs], device
                     )
                     for i in range(batch.shape[0]):
-                        _map, entropy = get_raw_attention(
+                        _map, entropy = get_attention_rollout(
                             model,
                             batch[i : i + 1],
                             cascade_context.grid_size,
@@ -1027,7 +1098,8 @@ def run_cascading_experiment(
                         )
                         entropy_vals.append(entropy)
                 np.save(
-                    results_dir / ("raw_attn_entropy_depth%02d.npy" % depth),
+                    results_dir
+                    / ("attention_rollout_entropy_depth%02d.npy" % depth),
                     np.array(entropy_vals, dtype=np.float64),
                 )
 
@@ -1070,7 +1142,7 @@ def run_cascading_experiment(
             if PRIMARY_SPEARMAN_VARIANT.get(method) == "signed_rms"
             else "spearman_abs_rms"
         )
-        if method in METHODS_CLASS_A or method in METHODS_CLASS_B.get(arch, []):
+        if method in METHODS_SCORED[arch]:
             _save_curve_characterization(
                 results_dir,
                 method,
@@ -1207,7 +1279,8 @@ def _blurred_deletion_curve(
 
     def flush() -> None:
         if pending:
-            batch = torch.stack(pending).to(device)
+            # Each pending state is (1, C, H, W); cat yields (N, C, H, W), not stack's (N, 1, C, H, W).
+            batch = torch.cat(pending, dim=0).to(device)
             scores.append(_target_probabilities(model, batch, target_class))
             pending.clear()
 
@@ -1414,14 +1487,14 @@ def build_qual_bundle(
             tgt = baseline_tgt
         raw = compute_fn(method, attr_inp, tgt)[0]
         out["baseline_" + method] = prepare_map_for_metric(raw, "abs_maxabs")
-        if method == "raw_attn" and cascade_context.grid_size is not None:
-            _raw_attn_map, per_head = get_raw_attention(
+        if method == "attention_rollout" and cascade_context.grid_size is not None:
+            _rollout_map, per_head = get_attention_rollout(
                 model,
                 attr_inp,
                 cascade_context.grid_size,
                 return_per_head=True,
             )
-            out["raw_attn_per_head"] = per_head
+            out["attention_rollout_per_head"] = per_head
         cascade = []
         for depth in range(len(order) + 1):
             cascade_context.depth = depth
@@ -1715,10 +1788,10 @@ def make_saliency_compute_fn(
                 ig_baseline=ig_baseline,
             )
         if attention_grid_size is not None:
-            if method == "raw_attn":
+            if method == "attention_rollout":
                 return np.stack(
                     [
-                        get_raw_attention(
+                        get_attention_rollout(
                             model,
                             batch[i : i + 1],
                             attention_grid_size,
@@ -1844,9 +1917,9 @@ def _run_arch_pipeline(
     )
 
     scored_methods = [m for m in methods if m in METHODS_SCORED[arch]]
-    if arch == "vit" and "raw_attn" in scored_methods:
+    if arch == "vit" and "attention_rollout" in scored_methods:
         first_img, _ = dataset[0]
-        validate_raw_attention(model, first_img[None].to(device), name=arch)
+        validate_attention_rollout(model, first_img[None].to(device), name=arch)
     all_images, all_targets, gt_labels = load_all_images(loader, model, device)
     ig_completeness_pass_rate = None
     if "ig" in scored_methods:
@@ -2065,9 +2138,9 @@ def run_occlusion_pipeline(
         image_size=image_size,
         ig_baseline=ig_baseline,
     )
-    if arch == "vit" and "raw_attn" in methods:
+    if arch == "vit" and "attention_rollout" in methods:
         first_img, _ = dataset[0]
-        validate_raw_attention(model, first_img[None].to(device), name=arch)
+        validate_attention_rollout(model, first_img[None].to(device), name=arch)
 
     missing = [
         m for m in methods if not _method_baseline_exists(results_dir, m, seed=seed)
