@@ -535,24 +535,27 @@ def _show_map_panel(
 
 
 def select_depth_indices(n_depths: int, max_cols: Optional[int] = None) -> List[int]:
-    """Subsample cascade depth indices. max_cols=None shows every step (Adebayo-style)."""
-    if n_depths <= 0:
+    """Subsample cascade depth indices for display (depths >= 1; depth 0 is the baseline column)."""
+    if n_depths <= 1:
         return []
     if max_cols is None:
-        return list(range(n_depths))
+        return list(range(1, n_depths))
     # max_cols is total grid columns including the Normal Model column
     max_depth_cols = max_cols - 1
-    if n_depths <= max_depth_cols:
-        return list(range(n_depths))
+    if max_depth_cols <= 0:
+        return []
+    n_cascade = n_depths - 1
+    if n_cascade <= max_depth_cols:
+        return list(range(1, n_depths))
     n_show = max_depth_cols
     if n_show <= 1:
-        return [0]
+        return [1]
     if n_show == 2:
-        return [0, n_depths - 1]
-    raw = np.linspace(0, n_depths - 1, n_show)
+        return [1, n_depths - 1]
+    raw = np.linspace(1, n_depths - 1, n_show)
     indices = sorted(set(int(round(x)) for x in raw))
-    if indices[0] != 0:
-        indices = [0] + indices
+    if indices[0] != 1:
+        indices = [1] + indices
     if indices[-1] != n_depths - 1:
         indices.append(n_depths - 1)
     return indices
@@ -667,9 +670,10 @@ def plot_cascade_paper_grid(
     show: bool = False,
 ) -> Optional[plt.Figure]:
     """
-    Adebayo-style grid: rows = saliency methods, cols = baseline + cascade depths.
+    Adebayo-style grid: rows = saliency methods, cols = Normal Model + cascade depths.
 
-    max_depth_cols=None shows every randomization step (e.g. all 17 for ResNet-50).
+    Depth 0 (pretrained) is shown only in the Normal Model column; cascade columns
+    start at depth 1. max_depth_cols=None shows every randomization step.
     Set max_depth_cols=8 to subsample for a compact figure.
 
     Default overlay=True (jet on input image), matching commit 33413b2 primary figures.
@@ -698,16 +702,13 @@ def plot_cascade_paper_grid(
     n_depths = len(cascade0)
     if depth_indices is None:
         depth_indices = select_depth_indices(n_depths, max_cols=max_depth_cols)
-    depth_indices = list(depth_indices)
+    depth_indices = [d for d in depth_indices if d > 0]
     arch_family = resolve_arch_family(arch, order)
 
     col_labels = ["Normal\nModel"]
     for d in depth_indices:
-        if d == 0:
-            col_labels.append("Pretrained\n(depth 0)")
-        else:
-            layer = order[d - 1] if d - 1 < len(order) else ""
-            col_labels.append(format_cascade_column_label(layer, arch_family))
+        layer = order[d - 1] if d - 1 < len(order) else ""
+        col_labels.append(format_cascade_column_label(layer, arch_family))
 
     nrows = len(methods)
     ncols = 1 + len(depth_indices)
@@ -836,7 +837,7 @@ def plot_cascading_grid(
     dpi: int = 150,
     show: bool = False,
 ) -> Optional[plt.Figure]:
-    """Vertical strip: input, baseline, then each cascade depth for one method."""
+    """Vertical strip: input, Normal Model baseline, then cascade depths >= 1."""
     qual_path = Path(qual_path)
     if not qual_path.exists():
         return None
@@ -849,6 +850,7 @@ def plot_cascading_grid(
     if cascade_key is None or baseline_key is None:
         return None
     cascade = data[cascade_key]
+    cascade_display = list(cascade[1:])
     order = list(data["order"])
     arch_family = resolve_arch_family(arch, order)
     rgb = np.clip(np.asarray(data["image"], dtype=np.float64), 0.0, 1.0)
@@ -859,11 +861,11 @@ def plot_cascading_grid(
     strip_maps = None
     if row_shared:
         strip_maps = prepare_cascade_row_for_display(
-            [data[baseline_key], *list(cascade)],
+            [data[baseline_key], *cascade_display],
             display_norm=display_norm,
             percentile=display_percentile,
         )
-    nrows = len(cascade) + 2
+    nrows = len(cascade_display) + 2
     fig = plt.figure(figsize=(4, 0.4 * nrows))
     gs = gridspec.GridSpec(nrows, 1)
     ax = fig.add_subplot(gs[0])
@@ -882,9 +884,10 @@ def plot_cascading_grid(
         display_percentile=display_percentile,
         display_norm="as_is" if strip_maps is not None else display_norm,
     )
-    ax.set_title("Baseline (no randomization)")
+    ax.set_title("Normal Model")
     ax.axis("off")
-    for i, m in enumerate(cascade):
+    for i, m in enumerate(cascade_display):
+        depth = i + 1
         ax = fig.add_subplot(gs[i + 2])
         _show_map_panel(
             ax,
@@ -897,12 +900,9 @@ def plot_cascading_grid(
             display_percentile=display_percentile,
             display_norm="as_is" if strip_maps is not None else display_norm,
         )
-        if i == 0:
-            label = "Pretrained (no randomization)"
-        else:
-            layer = order[i - 1] if i - 1 < len(order) else ""
-            label = format_cascade_column_label(layer, arch_family)
-        ax.set_title("Depth %d: %s" % (i, label), fontsize=8)
+        layer = order[depth - 1] if depth - 1 < len(order) else ""
+        label = format_cascade_column_label(layer, arch_family)
+        ax.set_title("Depth %d: %s" % (depth, label), fontsize=8)
         ax.axis("off")
     if title:
         fig.suptitle(title)
