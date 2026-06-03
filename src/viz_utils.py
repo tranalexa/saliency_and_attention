@@ -26,6 +26,18 @@ METHOD_DISPLAY_NAMES = {
 CASCADE_MASK_CMAP_UNIFIED = "bwr"
 CASCADE_MASK_CMAP_PAPER = "gray"
 
+
+def show_figure(fig, *, close: bool = True) -> None:
+    """Display a figure inline in Jupyter, or fall back to ``plt.show()``."""
+    try:
+        from IPython.display import display
+
+        display(fig)
+    except ImportError:
+        plt.show()
+    if close:
+        plt.close(fig)
+
 # Named presets for notebooks: suffix -> plot_cascade_paper_grid kwargs.
 CASCADE_DISPLAY_PRESETS = {
     "bwr_pct": {
@@ -815,7 +827,7 @@ def plot_cascade_paper_grid(
     if out_path:
         fig.savefig(Path(out_path), dpi=dpi, bbox_inches="tight", pad_inches=0.15)
     if show:
-        plt.show()
+        show_figure(fig)
     else:
         plt.close(fig)
     return fig
@@ -910,7 +922,7 @@ def plot_cascading_grid(
     if out_path:
         fig.savefig(Path(out_path), dpi=dpi, bbox_inches="tight")
     if show:
-        plt.show()
+        show_figure(fig)
     else:
         plt.close(fig)
     return fig
@@ -1097,7 +1109,7 @@ def plot_occlusion_faithfulness_curves(
     out_path = figures_dir / "occlusion_faithfulness_curves.png"
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     if show:
-        plt.show()
+        show_figure(fig)
     else:
         plt.close(fig)
     return out_path
