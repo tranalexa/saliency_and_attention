@@ -23,6 +23,19 @@ for arch in "${ARCHS[@]}"; do
   fi
 done
 
+if modal volume ls "$VOLUME" "/figures/subset_examples" >/dev/null 2>&1; then
+  echo "Downloading figures/subset_examples -> $DEST/figures/subset_examples/"
+  mkdir -p "$DEST/figures"
+  modal volume get "$VOLUME" "/figures/subset_examples" "$DEST/figures"
+  FOUND=1
+fi
+if modal volume ls "$VOLUME" "/figures/subset_sample_grid.png" >/dev/null 2>&1; then
+  echo "Downloading figures/subset_sample_grid.png"
+  mkdir -p "$DEST/figures"
+  modal volume get "$VOLUME" "/figures/subset_sample_grid.png" "$DEST/figures/subset_sample_grid.png"
+  FOUND=1
+fi
+
 if [[ "$FOUND" -eq 0 ]]; then
   echo "No results found on volume '$VOLUME'. Run an experiment first, e.g.:"
   echo "  modal run modal/app.py --experiment resnet50 --num-images 10 --skip-qual"
@@ -62,4 +75,7 @@ PY
 
 echo ""
 echo "Done. Results in $DEST"
+echo "Legacy ViT/ResNet files from old methods? Clean without re-running:"
+echo "  python3 scripts/clean_stale_results.py --apply"
+echo "  python3 scripts/clean_stale_results.py --apply --modal   # also trim Modal volume"
 echo "Run: jupyter notebook notebooks/notebook_analysis.ipynb"

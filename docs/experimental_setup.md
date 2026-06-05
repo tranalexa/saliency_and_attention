@@ -93,8 +93,8 @@ Used for logit-correlation bands in analysis plots and \(D_{\text{arch}}\) in se
 | `within_arch_{arch}_spearman.png` | `{method}_spearman_*_mean.npy` (alias-aware) |
 | `class_b_spatial_attribution_within_arch.png` | GradCAM / transformer_gradcam |
 | ViT rollout + entropy panel | `attention_rollout` curve + `*_entropy_depth*.npy` |
-| `occlusion_faithfulness_curves.png` | `occlusion_{method}_curve_frac020.npy` (20% default plot) |
-| `occlusion_auc_by_fraction.png` | `occlusion_auc_summary.csv` |
+| `occlusion_faithfulness_curves_{arch}.png` | `occlusion_{method}_curve_frac020.npy` (20% default; y-axis tight to curve range) |
+| `occlusion_auc_by_fraction_{arch}.png` | `occlusion_auc_summary.csv` |
 | Sensitivity-ratio LaTeX table | `*_curve_stats.json` (Class A, B, C) |
 
 Attention-rollout qual rows use **shared row-wise display scaling** so depth differences are visible (per-panel minmax was misleading).

@@ -16,12 +16,29 @@ from metrics_utils import abs_grayscale_norm
 METHOD_DISPLAY_NAMES = {
     "gradient": "Gradient",
     "input_grad": "Input-Grad",
-    "ig": "Integrated\nGradients",
+    "ig": "Integrated Gradients",
     "gradcam": "GradCAM",
-    "transformer_gradcam": "Transformer\nGradCAM",
-    "gbp": "Guided\nBackProp",
-    "attention_rollout": "Attention\nRollout",
+    "transformer_gradcam": "Transformer GradCAM",
+    "gbp": "Guided Backprop",
+    "attention_rollout": "Attention Rollout",
 }
+
+METRIC_AXIS_LABELS = {
+    "spearman": "Spearman correlation",
+    "ssim": "SSIM",
+    "ssim_abs_rms": "SSIM (magnitude maps)",
+}
+
+METRIC_TABLE_TITLES = {
+    "spearman": "Spearman",
+    "ssim": "SSIM",
+    "ssim_abs_rms": "SSIM (magnitude maps)",
+}
+
+
+def method_display_name(method: str) -> str:
+    """Human-readable method name for legends and tables."""
+    return METHOD_DISPLAY_NAMES.get(method, method.replace("_", " ").title())
 
 # Default: one colormap for every method (fair cross-method comparison).
 CASCADE_MASK_CMAP_UNIFIED = "bwr"
@@ -222,8 +239,8 @@ def add_logit_corr_band(
     arch: str,
     *,
     x_values: Sequence[float] | None = None,
-    label: str = "Model output preservation (logit corr to pretrained)",
-    annotate_resnet_skip: bool = True,
+    label: str = "Logit correlation (pretrained)",
+    annotate_resnet_skip: bool = False,
 ) -> plt.Axes | None:
     """Overlay model-output preservation as a gray twin-axis control band."""
     logit_corr = _load_logit_corr(results_root, arch)
@@ -238,7 +255,7 @@ def add_logit_corr_band(
     twin.fill_between(x[:n], 0.0, y[:n], color="0.85", alpha=0.55, label=label)
     twin.plot(x[:n], y[:n], color="0.45", linewidth=1.0)
     twin.set_ylim(0, 1)
-    twin.set_ylabel("logit corr", color="0.35", fontsize=8)
+    twin.set_ylabel("Logit correlation", color="0.35", fontsize=8)
     twin.tick_params(axis="y", labelsize=7, colors="0.35")
     if arch == "resnet50" and annotate_resnet_skip:
         ax.text(
@@ -290,9 +307,9 @@ def add_attention_rollout_entropy_overlay(
     threshold = 0.8 * np.log(num_patches)
     twin = ax.twinx()
     twin.plot(
-        x, entropy, color="tab:red", linewidth=1.0, label="last-block attention entropy"
+        x, entropy, color="tab:red", linewidth=1.0, label="Attention entropy"
     )
-    twin.set_ylabel("attention entropy", color="tab:red", fontsize=8)
+    twin.set_ylabel("Attention entropy", color="tab:red", fontsize=8)
     twin.tick_params(axis="y", labelsize=7, colors="tab:red")
     collapsed = entropy > threshold
     if np.any(collapsed):
@@ -304,7 +321,7 @@ def add_attention_rollout_entropy_overlay(
             transform=ax.get_xaxis_transform(),
             color="tab:red",
             alpha=0.10,
-            label="Attention near-uniform",
+            label="Near-uniform attention",
         )
     return twin
 
@@ -343,7 +360,7 @@ def add_gradcam_unreliable_overlay(
             transform=ax.get_xaxis_transform(),
             color="tab:orange",
             alpha=0.12,
-            label="GradCAM unreliable (>20% zero maps)",
+            label="GradCAM zero maps",
         )
     return ax
 
@@ -661,7 +678,7 @@ def pick_qual_image_index_shared(
 
 
 def _method_display(method: str) -> str:
-    return METHOD_DISPLAY_NAMES.get(method, method.replace("_", " ").title())
+    return method_display_name(method)
 
 
 def plot_cascade_paper_grid(
@@ -964,7 +981,7 @@ def load_arch_baseline_maps(
 
 
 def _method_display_label(method: str) -> str:
-    return METHOD_DISPLAY_NAMES.get(method, method.replace("_", " "))
+    return method_display_name(method)
 
 
 def _load_step0_target_confidence(
@@ -1008,16 +1025,43 @@ def _occlusion_mean_std_curve(
     return mean_post, std_post, False
 
 
+def _set_tight_ylim(
+    ax: plt.Axes,
+    values: Sequence[float],
+    *,
+    pad_fraction: float = 0.08,
+    clamp: tuple[float, float] | None = (0.0, 1.0),
+) -> None:
+    """Set y-limits to the data range with padding (reduces empty margin)."""
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return
+    lo, hi = float(np.min(arr)), float(np.max(arr))
+    span = hi - lo
+    if span <= 0:
+        span = max(abs(hi), 1e-3)
+    pad = span * pad_fraction
+    lo, hi = lo - pad, hi + pad
+    if clamp is not None:
+        lo = max(clamp[0], lo)
+        hi = min(clamp[1], hi)
+    if hi > lo:
+        ax.set_ylim(lo, hi)
+
+
 def _plot_occlusion_curve_band(
     ax,
     x: np.ndarray,
     mean: np.ndarray,
     std: np.ndarray | None,
     label: str,
+    *,
+    show_std_band: bool = False,
     **kwargs,
 ) -> None:
     ax.plot(x, mean, marker="o", markersize=3, label=label, **kwargs)
-    if std is not None and np.any(std > 0):
+    if show_std_band and std is not None and np.any(std > 0):
         ax.fill_between(x, mean - std, mean + std, alpha=0.18)
 
 
@@ -1078,14 +1122,36 @@ def load_occlusion_auc_summary(
     return rows
 
 
+def _plot_occlusion_auc_by_fraction_on_ax(
+    ax: plt.Axes,
+    arch_rows: list[dict],
+    methods: Sequence[str],
+) -> tuple[bool, list[float]]:
+    plotted = False
+    y_values: list[float] = []
+    for method in methods:
+        method_rows = sorted(
+            [r for r in arch_rows if r.get("method") == method],
+            key=lambda r: float(r["patch_fraction"]),
+        )
+        if not method_rows:
+            continue
+        x = [float(r["patch_fraction"]) for r in method_rows]
+        y = [float(r["auc_mean"]) for r in method_rows]
+        ax.plot(x, y, marker="o", markersize=4, label=method_display_name(method))
+        y_values.extend(y)
+        plotted = True
+    return plotted, y_values
+
+
 def plot_occlusion_auc_by_fraction(
     results_root: Path | str,
     archs: dict[str, dict],
     figures_dir: Path | str,
     dpi: int = 150,
     show: bool = True,
-) -> Path | None:
-    """Plot mean occlusion AUC vs patch_fraction (stability across thresholds)."""
+) -> list[Path]:
+    """Plot mean occlusion AUC vs patch fraction — one figure per architecture."""
     results_root = Path(results_root)
     figures_dir = Path(figures_dir)
     figures_dir.mkdir(parents=True, exist_ok=True)
@@ -1093,66 +1159,75 @@ def plot_occlusion_auc_by_fraction(
     rows = load_occlusion_auc_summary(results_root, archs)
     if not rows:
         print("No occlusion AUC summary data found.")
-        return None
+        return []
 
     arch_items = [(arch, cfg) for arch, cfg in archs.items() if cfg.get("methods")]
     if not arch_items:
-        return None
+        return []
 
-    fig, axes = plt.subplots(1, len(arch_items), figsize=(6 * len(arch_items), 4.5))
-    if len(arch_items) == 1:
-        axes = [axes]
-
-    any_plotted = False
-    for ax, (arch, cfg) in zip(axes, arch_items):
+    saved: list[Path] = []
+    for arch, cfg in arch_items:
         title = cfg.get("title", arch)
         arch_rows = [r for r in rows if r.get("architecture") == title]
-        arch_plotted = False
-        for method in cfg["methods"]:
-            method_rows = sorted(
-                [r for r in arch_rows if r.get("method") == method],
-                key=lambda r: float(r["patch_fraction"]),
-            )
-            if not method_rows:
-                continue
-            x = [float(r["patch_fraction"]) for r in method_rows]
-            y = [float(r["auc_mean"]) for r in method_rows]
-            yerr = [float(r.get("auc_std", 0.0)) for r in method_rows]
-            ax.errorbar(
-                x,
-                y,
-                yerr=yerr,
-                marker="o",
-                capsize=3,
-                label=_method_display_label(method),
-            )
-            arch_plotted = True
-            any_plotted = True
-        ax.set_title("%s — occlusion AUC vs fraction" % title)
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        plotted, y_values = _plot_occlusion_auc_by_fraction_on_ax(
+            ax, arch_rows, cfg["methods"]
+        )
+        if not plotted:
+            plt.close(fig)
+            continue
+        ax.set_title("%s — occlusion AUC vs. patch fraction" % title)
         ax.set_xlabel("Patch fraction occluded")
         ax.set_ylabel("Mean target softmax AUC")
-        ax.set_ylim(0.0, 1.0)
-        if arch_plotted:
-            ax.legend(fontsize=8, loc="best")
-
-    if not any_plotted:
-        plt.close(fig)
+        _set_tight_ylim(ax, y_values)
+        ax.legend(fontsize=8, loc="best")
+        fig.tight_layout()
+        out_path = figures_dir / ("occlusion_auc_by_fraction_%s.png" % arch)
+        fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+        saved.append(out_path)
+        if show:
+            show_figure(fig)
+        else:
+            plt.close(fig)
+    if not saved:
         print("No occlusion AUC fraction data to plot.")
-        return None
+    return saved
 
-    fig.suptitle(
-        "Occlusion faithfulness stability (lower = more faithful)",
-        y=1.02,
-        fontsize=11,
-    )
-    fig.tight_layout()
-    out_path = figures_dir / "occlusion_auc_by_fraction.png"
-    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
-    if show:
-        show_figure(fig)
-    else:
-        plt.close(fig)
-    return out_path
+
+def _plot_occlusion_faithfulness_on_ax(
+    ax: plt.Axes,
+    results_root: Path,
+    arch: str,
+    cfg: dict,
+    *,
+    mech_arch_tags: dict[str, str] | None,
+    patch_fraction: float,
+) -> tuple[int, bool, list[float]]:
+    """Return (n_methods_plotted, used_step0, mean_y_values)."""
+    from experiment_utils import find_method_result_path, _occlusion_fraction_suffix
+
+    step0 = _load_step0_target_confidence(results_root, arch, mech_arch_tags)
+    used_step0 = step0 is not None
+    plotted = 0
+    y_values: list[float] = []
+    arch_dir = results_root / arch
+    suffix = _occlusion_fraction_suffix(patch_fraction)
+    for method in cfg["methods"]:
+        curve_path = find_method_result_path(
+            arch_dir, method, "occlusion_%s_curve%s.npy" % ("%s", suffix)
+        ) or (arch_dir / ("occlusion_%s_curve%s.npy" % (method, suffix)))
+        mean, std, has_step0 = _occlusion_mean_std_curve(curve_path, step0)
+        if mean is None:
+            continue
+        if step0 is not None and not has_step0:
+            used_step0 = False
+        x = np.arange(len(mean)) if has_step0 else np.arange(1, len(mean) + 1)
+        _plot_occlusion_curve_band(
+            ax, x, mean, std, method_display_name(method), show_std_band=False
+        )
+        y_values.extend(float(v) for v in mean if np.isfinite(v))
+        plotted += 1
+    return plotted, used_step0, y_values
 
 
 def plot_occlusion_faithfulness_curves(
@@ -1163,12 +1238,12 @@ def plot_occlusion_faithfulness_curves(
     patch_fraction: float = 0.20,
     dpi: int = 150,
     show: bool = True,
-) -> Path | None:
+) -> list[Path]:
     """
     Binder-style blurred-patch deletion curves: mean target softmax vs step.
 
-    Loads ``occlusion_{method}_curve_fracXXX.npy`` for the given patch_fraction
-    and prepends step 0 from saved mechanistic logits + target_indices when available.
+    One figure per architecture. Loads ``occlusion_{method}_curve_fracXXX.npy`` and
+    prepends step 0 when available. Y-axis is scaled to the plotted curve range.
     """
     results_root = Path(results_root)
     figures_dir = Path(figures_dir)
@@ -1177,78 +1252,47 @@ def plot_occlusion_faithfulness_curves(
     arch_items = [(arch, cfg) for arch, cfg in archs.items() if cfg.get("methods")]
     if not arch_items:
         print("No architectures configured for occlusion faithfulness plot.")
-        return None
+        return []
 
-    fig, axes = plt.subplots(1, len(arch_items), figsize=(6 * len(arch_items), 4.5))
-    if len(arch_items) == 1:
-        axes = [axes]
-
-    any_curve = False
-    used_step0 = True
-    for ax, (arch, cfg) in zip(axes, arch_items):
-        step0 = _load_step0_target_confidence(results_root, arch, mech_arch_tags)
-        if step0 is None:
-            used_step0 = False
-        plotted = 0
-        for method in cfg["methods"]:
-            from experiment_utils import find_method_result_path, _occlusion_fraction_suffix
-
-            arch_dir = results_root / arch
-            suffix = _occlusion_fraction_suffix(patch_fraction)
-            curve_path = find_method_result_path(
-                arch_dir, method, "occlusion_%s_curve%s.npy" % ("%s", suffix)
-            ) or (arch_dir / ("occlusion_%s_curve%s.npy" % (method, suffix)))
-            mean, std, has_step0 = _occlusion_mean_std_curve(curve_path, step0)
-            if mean is None:
-                continue
-            if step0 is not None and not has_step0:
-                used_step0 = False
-            x = np.arange(len(mean)) if has_step0 else np.arange(1, len(mean) + 1)
-            _plot_occlusion_curve_band(
-                ax, x, mean, std, _method_display_label(method)
-            )
-            plotted += 1
-            any_curve = True
+    saved: list[Path] = []
+    warned_step0 = False
+    for arch, cfg in arch_items:
         title = cfg.get("title", arch)
-        ax.set_title(
-            "%s — blurred-patch deletion (%.0f%%)" % (title, patch_fraction * 100)
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        plotted, used_step0, y_values = _plot_occlusion_faithfulness_on_ax(
+            ax,
+            results_root,
+            arch,
+            cfg,
+            mech_arch_tags=mech_arch_tags,
+            patch_fraction=patch_fraction,
         )
-        ax.set_xlabel("Occlusion step (top fraction-ranked units)")
-        ax.set_ylabel("Mean target softmax confidence")
-        ax.set_ylim(0.0, 1.0)
-        if plotted:
-            ax.legend(fontsize=8, loc="best")
-        else:
-            ax.text(
-                0.5,
-                0.5,
-                "No occlusion curve files found",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
+        if plotted == 0:
+            plt.close(fig)
+            continue
+        if not used_step0 and not warned_step0:
+            print(
+                "Warning: mechanistic logits or target_indices missing; "
+                "plotting occlusion steps only (no step 0)."
             )
-
-    if not any_curve:
-        plt.close(fig)
-        print("No occlusion curve files found for faithfulness plot.")
-        return None
-
-    if not used_step0:
-        print(
-            "Warning: mechanistic logits or target_indices missing; "
-            "plotting occlusion steps only (no step 0)."
+            warned_step0 = True
+        ax.set_title(
+            "%s — blurred-patch deletion (%.0f%% occluded)"
+            % (title, patch_fraction * 100)
         )
-
-    fig.suptitle(
-        "Blurred-occlusion faithfulness (lower curves = more faithful)",
-        y=1.02,
-        fontsize=11,
-    )
-    fig.tight_layout()
-    out_path = figures_dir / "occlusion_faithfulness_curves.png"
-    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
-    if show:
-        show_figure(fig)
-    else:
-        plt.close(fig)
-    return out_path
+        ax.set_xlabel("Occlusion step (highest-saliency units first)")
+        ax.set_ylabel("Mean target softmax confidence")
+        _set_tight_ylim(ax, y_values)
+        ax.margins(x=0.02)
+        ax.legend(fontsize=8, loc="best")
+        fig.tight_layout()
+        out_path = figures_dir / ("occlusion_faithfulness_curves_%s.png" % arch)
+        fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+        saved.append(out_path)
+        if show:
+            show_figure(fig)
+        else:
+            plt.close(fig)
+    if not saved:
+        print("No occlusion curve files found for faithfulness plot.")
+    return saved
