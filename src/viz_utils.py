@@ -696,11 +696,12 @@ def plot_cascade_paper_grid(
     colormap_style: str = "unified",
     mask_cmap: str | None = None,
     display_norm: str = "minmax",
+    show_input_column: bool = True,
     dpi: int = 150,
     show: bool = False,
 ) -> Optional[plt.Figure]:
     """
-    Adebayo-style grid: rows = saliency methods, cols = Normal Model + cascade depths.
+    Adebayo-style grid: rows = saliency methods, cols = Input + Normal Model + cascade depths.
 
     Depth 0 (pretrained) is shown only in the Normal Model column; cascade columns
     start at depth 1. max_depth_cols=None shows every randomization step.
@@ -735,13 +736,25 @@ def plot_cascade_paper_grid(
     depth_indices = [d for d in depth_indices if d > 0]
     arch_family = resolve_arch_family(arch, order)
 
-    col_labels = ["Normal\nModel"]
+    columns: list[tuple[str, int | None]] = []
+    if show_input_column:
+        columns.append(("input", None))
+    columns.append(("normal", None))
     for d in depth_indices:
-        layer = order[d - 1] if d - 1 < len(order) else ""
-        col_labels.append(format_cascade_column_label(layer, arch_family))
+        columns.append(("cascade", d))
+
+    col_labels: list[str] = []
+    for kind, d in columns:
+        if kind == "input":
+            col_labels.append("Input")
+        elif kind == "normal":
+            col_labels.append("Normal\nModel")
+        else:
+            layer = order[d - 1] if d is not None and d - 1 < len(order) else ""
+            col_labels.append(format_cascade_column_label(layer, arch_family))
 
     nrows = len(methods)
-    ncols = 1 + len(depth_indices)
+    ncols = len(columns)
     label_col_width = 0.48
     col_inches = 0.72 if ncols > 14 else (0.85 if ncols > 10 else 1.15)
     fig_w = col_inches * ncols + label_col_width
@@ -786,10 +799,20 @@ def plot_cascade_paper_grid(
             row_display_maps = prepare_cascade_row_for_display(
                 row_maps, display_norm=display_norm, percentile=display_percentile
             )
-        for j in range(ncols):
+        map_idx = 0
+        for j, (kind, d) in enumerate(columns):
             ax = fig.add_subplot(gs[i, j + 1])
-            if row_display_maps is not None:
-                sal = row_display_maps[j]
+            if kind == "input":
+                _show_map_panel(
+                    ax,
+                    rgb,
+                    None,
+                    overlay=overlay,
+                    show_input_only=True,
+                )
+            elif row_display_maps is not None:
+                sal = row_display_maps[map_idx]
+                map_idx += 1
                 _show_map_panel(
                     ax,
                     rgb,
@@ -801,8 +824,7 @@ def plot_cascade_paper_grid(
                     display_percentile=display_percentile,
                     display_norm="as_is",
                 )
-            elif j == 0:
-                # Normal Model = saliency from pretrained weights (not a plain photo).
+            elif kind == "normal":
                 _show_map_panel(
                     ax,
                     rgb,
@@ -815,7 +837,6 @@ def plot_cascade_paper_grid(
                     display_norm=display_norm,
                 )
             else:
-                d = depth_indices[j - 1]
                 _show_map_panel(
                     ax,
                     rgb,
