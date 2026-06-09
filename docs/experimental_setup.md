@@ -47,7 +47,6 @@ std  = (0.229, 0.224, 0.225)
 
 ```bash
 python scripts/build_subset_manifest.py --imagenet-root "$IMAGENET_ROOT"
-# Modal: modal run modal/build_subset_manifest.py
 ```
 
 `dataset_index` in the manifest = cascade / occlusion / qual `image_index`.

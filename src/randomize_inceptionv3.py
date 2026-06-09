@@ -1,4 +1,4 @@
-"""Cascading/independent block randomization for InceptionV3."""
+"""Legacy TF replication only: cascading/independent block randomization for InceptionV3."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -28,28 +28,23 @@ def build_parser():
     parser.add_argument(
         '--chkpntpath',
         dest='chkpntpath',
-        default=('/home/julius/research/test_sanity_checks/'
-                 'models/inceptionv3/inception_v3.ckpt'))
+        default='models/inceptionv3/inception_v3.ckpt')
     parser.add_argument(
         '--labeldatapath',
         dest='labeldatapath',
-        default=('/home/julius/research/test_sanity_checks/'
-                 'models/inceptionv3/inception_v3.ckpt'))
+        default='models/inceptionv3/imagenet_class_index.json')
     parser.add_argument(
         '--inputimgfolderpath',
         dest='inputimgfolderpath',
-        default=('/home/julius/research/sanity_checks_saliency/'
-                 'data/demo_images/'))
+        default='data/demo_images/')
     parser.add_argument(
         '--normaloutputpath',
         dest='normaloutputpath',
-        default=('/home/julius/research/test_sanity_checks/data/models/'
-                 'inceptionv3/saliency_independent_rand'))
+        default='results/legacy_tf/inceptionv3/saliency_pretrained')
     parser.add_argument(
         '--randoutputpath',
         dest='randoutputpath',
-        default=('/home/julius/research/test_sanity_checks/data/models/'
-                 'inceptionv3/saliency_independent_rand'))
+        default='results/legacy_tf/inceptionv3/saliency_randomized')
     parser.add_argument(
         '--log',
         dest='logging',

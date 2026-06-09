@@ -57,10 +57,10 @@ jupyter notebook notebooks/notebook_analysis.ipynb
 
 ## Manifest
 
-After ImageNet is on the volume:
+After ImageNet is on the volume (or locally with `IMAGENET_ROOT`):
 
 ```bash
-modal run modal/build_subset_manifest.py
+python scripts/build_subset_manifest.py --imagenet-root "$IMAGENET_ROOT"
 ```
 
 Maps `dataset_index` → filename, WNID, class name. Use for fixed qual indices (e.g. `--image-index 196`).

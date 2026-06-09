@@ -70,8 +70,8 @@ Downloads `resnet50/`, `vit/`, `mechanistic/` only (not stale `dinov2/`).
 ## Manifest on Modal
 
 ```bash
-modal run modal/build_subset_manifest.py
-# Writes locally + volume diagnostics/subset_manifest_first500.json
+python scripts/build_subset_manifest.py --imagenet-root "$IMAGENET_ROOT"
+# Writes results/diagnostics/subset_manifest_first500.json
 ```
 
 Pick `dataset_index` from manifest for qual, e.g. hotdog at index 196:

@@ -1,4 +1,4 @@
-"""Training lenet style CNN on mnist of fashion mnist."""
+"""Legacy TF replication only: train MLP on MNIST or Fashion-MNIST."""
 
 from __future__ import absolute_import
 from __future__ import division

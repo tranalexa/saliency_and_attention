@@ -6,9 +6,9 @@ Usage (from repo root, with ImageNet on disk or IMAGENET_ROOT):
   python scripts/build_subset_manifest.py --imagenet-root /path/to/imagenet
   python scripts/build_subset_manifest.py --num-images 500 --output results/diagnostics/subset_manifest_first500.json
 
-On Modal volume (from laptop):
+On Modal volume (copy manifest locally after building on a machine with ImageNet):
 
-  modal run scripts/build_subset_manifest.py --imagenet-root /imagenet
+  python scripts/build_subset_manifest.py --imagenet-root /path/to/imagenet
 """
 from __future__ import annotations
 

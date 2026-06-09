@@ -19,6 +19,23 @@ The original TensorFlow / Inception / MNIST replication remains under `notebooks
 export IMAGENET_ROOT=/path/to/imagenet   # local only; needs val/
 ```
 
+**Dependencies:** use `requirements-pytorch.txt` for the active PyTorch pipeline; `requirements.txt` is only for legacy TensorFlow notebooks under `notebooks/legacy_tf/`.
+
+## For reviewers / graders
+
+Two ways to reproduce figures without re-running the full 500-image GPU pipeline:
+
+1. **Precomputed results (recommended):** extract `results_and_figures.zip` at the repo root so outputs land in `results/`, then run `jupyter notebook notebooks/notebook_analysis.ipynb`.
+2. **Full recompute:** requires a Modal account, ImageNet val set, and several GPU-hours — see [docs/modal.md](docs/modal.md).
+
+Optional (not required for grading):
+
+- Legacy TensorFlow replication: `notebooks/legacy_tf/` + `requirements.txt`
+- Qualitative gallery script: `scripts/run_qual_gallery.py` (see below)
+- Unit test: `pytest tests/`
+
+**Submitting this project:** submit a zip of the repo plus `results_and_figures.zip` separately (the results archive is gitignored due to size). A GitHub link works for code review; graders still need the results zip to regenerate figures locally.
+
 | Task | Command / doc |
 |------|----------------|
 | Cloud GPU runs | [docs/modal.md](docs/modal.md) |
@@ -47,7 +64,7 @@ Removed from active runs: DINOv2, `smoothgrad`, `gbp_gc`, legacy `rollout`, `din
 ## Data
 
 - ImageNet **val**, first **500** images in **sorted JPEG filename order** (`ILSVRC2012_val_00000001.JPEG`, …) — same indices for ResNet and ViT.
-- Human-readable index: `results/diagnostics/subset_manifest_first500.json` (build with `scripts/build_subset_manifest.py` or `modal run modal/build_subset_manifest.py`).
+- Human-readable index: `results/diagnostics/subset_manifest_first500.json` (build with `python scripts/build_subset_manifest.py --imagenet-root "$IMAGENET_ROOT"`).
 - 224×224 center crop, standard ImageNet normalization.
 
 ## Repository layout
@@ -57,8 +74,10 @@ Removed from active runs: DINOv2, `smoothgrad`, `gbp_gc`, legacy `rollout`, `din
 | `src/experiment_utils.py` | Pipelines: cascade, occlusion, qual bundle, mechanistic |
 | `src/attention_utils.py` | ViT attention rollout + validation hooks |
 | `src/viz_utils.py` | Cascade grids, occlusion curves, analysis plots |
+| `scripts/run_qual_gallery.py` | Build/render per-index qual heatmap galleries |
 | `notebooks/notebook_analysis.ipynb` | All paper figures from saved `.npy` / `.npz` |
 | `modal/app.py` | Modal entrypoint |
+| `legacy_figures/` | Original paper demo figures (reference only) |
 | `results/` | Local outputs (gitignored) |
 
 ## Qualitative figures
@@ -73,6 +92,13 @@ modal run modal/app.py --experiment all --qual-only \
 ```
 
 Outputs under `results/figures/`: `within_arch_*_spearman.png`, `cascade_grid_*.png`, `occlusion_faithfulness_curves.png`, sensitivity-ratio table, etc.
+
+Per-index qual galleries (after downloading qual bundles):
+
+```bash
+python scripts/run_qual_gallery.py --print-plan              # sample indices
+python scripts/run_qual_gallery.py --capture-index 303 --render
+```
 
 ## ViT-specific note
 

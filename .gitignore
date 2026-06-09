@@ -142,3 +142,8 @@ cython_debug/
 
 # PyTorch experiment outputs
 results/
+
+# macOS / IDE / archives
+.DS_Store
+*.zip
+.cursor/
