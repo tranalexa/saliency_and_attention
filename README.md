@@ -1,8 +1,6 @@
 # Sanity Checks for Saliency Maps
 
-Replication and extension of Adebayo et al. (*Sanity Checks for Saliency Maps*) with a **PyTorch** pipeline for **ResNet-50** and **ViT-B/16** on ImageNet, plus a **blurred-patch occlusion** faithfulness axis (Binder et al.).
-
-The original TensorFlow / Inception / MNIST replication remains under `notebooks/legacy_tf/` (see [legacy section](#legacy-tensorflow-replication) below).
+Fork of adebayoj/sanity_checks_saliency (Adebayo et al., arXiv:1806.07529). This repo extends the original TensorFlow / Inception / MNIST replication with a PyTorch pipeline for ResNet-50 and ViT-B/16 on ImageNet, plus a blurred-patch occlusion faithfulness axis (Binder et al.). The original TensorFlow / Inception / MNIST replication remains under `notebooks/legacy_tf/` (see [legacy section](#legacy-tensorflow-replication) below).
 
 ## What this fork measures
 
